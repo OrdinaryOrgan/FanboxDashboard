@@ -36,6 +36,10 @@ def test_frontend_index_served() -> None:
     assert response.status_code == 200
     assert "text/html" in response.headers["content-type"]
     assert "Fanbox Dashboard" in response.text
+    if main_module.FRONTEND_DIST.exists():
+        assert "<div id=\"app\"></div>" in response.text
+    else:
+        assert "frontend build was not found" in response.text
 
 
 def test_settings_roundtrip() -> None:

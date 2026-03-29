@@ -6,7 +6,40 @@ cd /d "%~dp0"
 set "APP_URL=http://127.0.0.1:8000/"
 set "HEALTH_URL=http://127.0.0.1:8000/health"
 set "BACKEND_DIR=%~dp0backend"
+set "FRONTEND_DIR=%~dp0frontend"
+set "FRONTEND_DIST=%FRONTEND_DIR%\dist\index.html"
 set "PYTHON_CMD="
+
+if not exist "%FRONTEND_DIST%" (
+  where npm.cmd >nul 2>nul
+  if %errorlevel% neq 0 (
+    echo npm was not found in PATH, so the frontend build could not be created.
+    pause
+    exit /b 1
+  )
+
+  pushd "%FRONTEND_DIR%"
+
+  if not exist "%FRONTEND_DIR%\node_modules" (
+    call npm.cmd install
+    if errorlevel 1 (
+      popd
+      echo npm install failed while preparing the frontend.
+      pause
+      exit /b 1
+    )
+  )
+
+  call npm.cmd run build
+  if errorlevel 1 (
+    popd
+    echo npm run build failed while preparing the frontend.
+    pause
+    exit /b 1
+  )
+
+  popd
+)
 
 for /f %%P in ('powershell -NoProfile -Command "(Get-NetTCPConnection -LocalPort 8000 -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty OwningProcess)"') do (
   set "BACKEND_PID=%%P"

@@ -3,8 +3,41 @@ $ProgressPreference = 'SilentlyContinue'
 
 $root = Split-Path -Parent $MyInvocation.MyCommand.Path
 $backendDir = Join-Path $root 'backend'
+$frontendDir = Join-Path $root 'frontend'
+$frontendDist = Join-Path $frontendDir 'dist\index.html'
 $appUrl = 'http://127.0.0.1:8000/'
 $healthUrl = 'http://127.0.0.1:8000/health'
+
+function Ensure-FrontendBuild {
+    if (Test-Path $frontendDist) {
+        return
+    }
+
+    $npm = Get-Command npm.cmd -ErrorAction SilentlyContinue
+    if (-not $npm) {
+        throw 'npm was not found in PATH, so the frontend build could not be created.'
+    }
+
+    Push-Location $frontendDir
+    try {
+        if (-not (Test-Path 'node_modules')) {
+            & $npm.Source install
+            if ($LASTEXITCODE -ne 0) {
+                throw 'npm install failed while preparing the frontend.'
+            }
+        }
+
+        & $npm.Source run build
+        if ($LASTEXITCODE -ne 0) {
+            throw 'npm run build failed while preparing the frontend.'
+        }
+    }
+    finally {
+        Pop-Location
+    }
+}
+
+Ensure-FrontendBuild
 
 $existing = Get-NetTCPConnection -LocalPort 8000 -ErrorAction SilentlyContinue | Select-Object -First 1
 if (-not $existing) {
