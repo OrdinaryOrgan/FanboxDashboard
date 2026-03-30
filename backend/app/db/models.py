@@ -32,17 +32,20 @@ class TaskStatus(StrEnum):
     RUNNING_EXTRACT = "running_extract"
     RUNNING_RENAME = "running_rename"
     RUNNING_REFRESH = "running_refresh"
+    RUNNING_ANNOTATE = "running_annotate"
     RUNNING_LOGIN = "running_login"
     COMPLETED = "completed"
     FAILED_DOWNLOAD = "failed_download"
     FAILED_EXTRACT = "failed_extract"
     FAILED_RENAME = "failed_rename"
     FAILED_PARSE = "failed_parse"
+    FAILED_ANNOTATE = "failed_annotate"
     FAILED_AUTH = "failed_auth"
 
 
 class TaskKind(StrEnum):
     REFRESH_POSTS = "refresh_posts"
+    ANNOTATE_TITLES = "annotate_titles"
     OPEN_LOGIN = "open_login"
     DOWNLOAD_POST = "download_post"
     RESCAN_LIBRARY = "rescan_library"
@@ -51,6 +54,22 @@ class TaskKind(StrEnum):
 class RefreshMode(StrEnum):
     INCREMENTAL = "incremental"
     FULL = "full"
+
+
+class TitleAnnotationStatus(StrEnum):
+    PENDING = "pending"
+    COMPLETED = "completed"
+    SKIPPED = "skipped"
+    FAILED = "failed"
+
+
+class TitleAnnotationSource(StrEnum):
+    NONE = "none"
+    DICTIONARY_FULL = "dictionary_full"
+    DICTIONARY_PHRASE = "dictionary_phrase"
+    DICTIONARY_FRAGMENT = "dictionary_fragment"
+    LLM = "llm"
+    LLM_CACHED = "llm_cached"
 
 
 class Settings(Base):
@@ -68,6 +87,11 @@ class Settings(Base):
     download_concurrency: Mapped[int] = mapped_column(default=5)
     posts_per_row: Mapped[int] = mapped_column(default=4)
     auto_delete_archive: Mapped[bool] = mapped_column(Boolean, default=True)
+    llm_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
+    llm_api_key: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    llm_base_url: Mapped[str] = mapped_column(String(500), default="https://api.deepseek.com")
+    llm_model: Mapped[str] = mapped_column(String(100), default="deepseek-chat")
+    title_aliases_path: Mapped[str] = mapped_column(String(500), default="")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
@@ -84,6 +108,11 @@ class Post(Base):
     detail_url: Mapped[str] = mapped_column(String(1000))
     cover_url: Mapped[str | None] = mapped_column(String(1000), nullable=True)
     mega_url: Mapped[str | None] = mapped_column(String(1000), nullable=True)
+    title_annotation: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    title_annotation_source: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    title_annotation_status: Mapped[str] = mapped_column(String(30), default=TitleAnnotationStatus.PENDING.value)
+    title_annotation_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    title_annotation_updated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     status: Mapped[str] = mapped_column(String(50), default=PostStatus.NEW.value)
     last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
     discovered_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())

@@ -9,12 +9,29 @@ from app.db.models import Artifact, Post, RefreshMode, Settings, Task, TaskStatu
 from app.db.session import get_db
 from app.schemas.archive import ArchiveActionResult, ArchiveDeleteRequest, ArchivePurgeRequest, OpenPathResult, YearOpenRequest
 from app.schemas.common import Envelope, TaskResponse
-from app.schemas.post import DownloadRequest, PostRead, RefreshRequest
-from app.schemas.settings import AuthStatus, SettingsRead, SettingsUpdate
+from app.schemas.post import DownloadRequest, PostRead, RefreshRequest, TitleAliasUpsertRequest, TitleAliasUpsertResult
+from app.schemas.settings import (
+    AuthStatus,
+    SettingsRead,
+    SettingsUpdate,
+    TitleAliasesClearResult,
+    TitleAnnotationCacheClearResult,
+)
 from app.schemas.task import RetryRequest, TaskClearResult, TaskRead
 from app.services.fanbox import inspect_auth_status
 from app.services.files import delete_archive_file, open_in_explorer, purge_archive_files, resolve_post_open_path
 from app.services.tasks import TaskManager
+from app.services.title_annotation import (
+    build_display_title,
+    clear_title_aliases_file,
+    ensure_title_aliases_file,
+    load_title_aliases,
+    prepare_post_title_annotation,
+    resolve_dictionary_annotation,
+    resolve_title_aliases_path,
+    title_needs_annotation,
+    upsert_title_alias_entries,
+)
 
 
 def _post_id_sort_key(post_id: str) -> tuple[int, int | str]:
@@ -45,6 +62,9 @@ def create_router(task_manager: TaskManager) -> APIRouter:
     def list_posts(db: Session = Depends(get_db)) -> Envelope[list[PostRead]]:
         posts = db.query(Post).order_by(Post.published_at.desc().nullslast(), Post.updated_at.desc()).all()
         posts = _dedupe_posts_by_mega(posts)
+        settings = db.get(Settings, 1)
+        assert settings is not None
+        aliases = load_title_aliases(settings=settings)
         payload: list[PostRead] = []
         for post in posts:
             artifact = db.query(Artifact).filter_by(post_id=post.id).one_or_none()
@@ -52,11 +72,16 @@ def create_router(task_manager: TaskManager) -> APIRouter:
                 artifact.extract_dir if artifact else None,
                 artifact.archive_path if artifact else None,
             )
+            dictionary_result = resolve_dictionary_annotation(post.title, aliases)
+            effective_annotation = dictionary_result.annotation if dictionary_result and dictionary_result.annotation else post.title_annotation
             payload.append(
                 PostRead(
                     id=post.id,
                     post_id=post.post_id,
                     title=post.title,
+                    title_annotation=effective_annotation,
+                    has_title_annotation=bool(effective_annotation),
+                    display_title=build_display_title(post.title, effective_annotation),
                     published_at=post.published_at,
                     detail_url=post.detail_url,
                     cover_url=post.cover_url,
@@ -66,6 +91,7 @@ def create_router(task_manager: TaskManager) -> APIRouter:
                     archive_path=artifact.archive_path if artifact else None,
                     extract_dir=artifact.extract_dir if artifact else None,
                     can_open_local_path=bool(open_path),
+                    needs_title_annotation=title_needs_annotation(post.title),
                     updated_at=post.updated_at,
                 )
             )
@@ -144,6 +170,7 @@ def create_router(task_manager: TaskManager) -> APIRouter:
             TaskStatus.RUNNING_EXTRACT.value,
             TaskStatus.RUNNING_RENAME.value,
             TaskStatus.RUNNING_REFRESH.value,
+            TaskStatus.RUNNING_ANNOTATE.value,
             TaskStatus.RUNNING_LOGIN.value,
         ]
         active_count = db.query(Task).filter(Task.status.in_(active_statuses)).count()
@@ -212,6 +239,64 @@ def create_router(task_manager: TaskManager) -> APIRouter:
         open_in_explorer(str(year_path))
         return Envelope(message="已打开年份目录。", data=OpenPathResult(opened_path=str(year_path)))
 
+    @router.post("/title-aliases/open", response_model=Envelope[OpenPathResult])
+    def open_title_aliases_path(db: Session = Depends(get_db)) -> Envelope[OpenPathResult]:
+        settings = db.get(Settings, 1)
+        assert settings is not None
+
+        aliases_path = ensure_title_aliases_file(resolve_title_aliases_path(settings))
+        open_target = aliases_path.parent if aliases_path.suffix else aliases_path
+        open_in_explorer(str(open_target))
+        return Envelope(message="Opened title aliases path.", data=OpenPathResult(opened_path=str(open_target)))
+
+    @router.post("/title-aliases/clear", response_model=Envelope[TitleAliasesClearResult])
+    def clear_title_aliases(db: Session = Depends(get_db)) -> Envelope[TitleAliasesClearResult]:
+        settings = db.get(Settings, 1)
+        assert settings is not None
+
+        aliases_path = clear_title_aliases_file(resolve_title_aliases_path(settings))
+        return Envelope(message="Local title aliases cleared.", data=TitleAliasesClearResult(cleared_path=str(aliases_path)))
+
+    @router.post("/title-aliases/upsert", response_model=Envelope[TitleAliasUpsertResult])
+    def upsert_title_aliases(payload: TitleAliasUpsertRequest, db: Session = Depends(get_db)) -> Envelope[TitleAliasUpsertResult]:
+        settings = db.get(Settings, 1)
+        assert settings is not None
+
+        post = db.query(Post).filter_by(post_id=payload.post_id).one_or_none()
+        if post is None:
+            raise HTTPException(status_code=404, detail="Post not found")
+        if not title_needs_annotation(post.title):
+            raise HTTPException(status_code=400, detail="This title does not need annotation.")
+
+        if payload.mode == "full_title":
+            translation = (payload.full_title_translation or "").strip()
+            if not translation:
+                raise HTTPException(status_code=400, detail="full_title_translation is required.")
+            updates = [(post.title, translation)]
+        else:
+            if not payload.entries:
+                raise HTTPException(status_code=400, detail="entries must not be empty.")
+            updates = [(entry.source, entry.target) for entry in payload.entries]
+
+        aliases_path, updated_count = upsert_title_alias_entries(resolve_title_aliases_path(settings), payload.mode, updates)
+        return Envelope(
+            message="Local title aliases updated.",
+            data=TitleAliasUpsertResult(updated_count=updated_count, aliases_path=str(aliases_path)),
+        )
+
+    @router.post("/title-annotations/clear-cache", response_model=Envelope[TitleAnnotationCacheClearResult])
+    def clear_title_annotation_cache(db: Session = Depends(get_db)) -> Envelope[TitleAnnotationCacheClearResult]:
+        posts = db.query(Post).all()
+        reset_count = 0
+        for post in posts:
+            if prepare_post_title_annotation(post, force_reset=True):
+                reset_count += 1
+        db.commit()
+        return Envelope(
+            message="LLM title annotation cache cleared.",
+            data=TitleAnnotationCacheClearResult(reset_count=reset_count),
+        )
+
     @router.post("/archives/purge", response_model=Envelope[ArchiveActionResult])
     def purge_archives(payload: ArchivePurgeRequest, db: Session = Depends(get_db)) -> Envelope[ArchiveActionResult]:
         settings = db.get(Settings, 1)
@@ -248,6 +333,11 @@ def create_router(task_manager: TaskManager) -> APIRouter:
                 download_concurrency=settings.download_concurrency,
                 posts_per_row=settings.posts_per_row,
                 auto_delete_archive=settings.auto_delete_archive,
+                llm_enabled=settings.llm_enabled,
+                llm_api_key=settings.llm_api_key or "",
+                llm_base_url=settings.llm_base_url,
+                llm_model=settings.llm_model,
+                title_aliases_path=settings.title_aliases_path,
             )
         )
 
@@ -266,6 +356,11 @@ def create_router(task_manager: TaskManager) -> APIRouter:
         settings.download_concurrency = payload.download_concurrency
         settings.posts_per_row = payload.posts_per_row
         settings.auto_delete_archive = payload.auto_delete_archive
+        settings.llm_enabled = payload.llm_enabled
+        settings.llm_api_key = payload.llm_api_key or None
+        settings.llm_base_url = payload.llm_base_url
+        settings.llm_model = payload.llm_model
+        settings.title_aliases_path = payload.title_aliases_path
         db.commit()
         task_manager.set_download_concurrency(payload.download_concurrency)
         return Envelope(message="设置已保存。", data=SettingsRead.model_validate(payload.model_dump()))

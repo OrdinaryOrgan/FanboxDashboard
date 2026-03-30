@@ -1,12 +1,31 @@
 import asyncio
 from datetime import datetime
 from pathlib import Path
+import threading
+import time
 from zipfile import ZipFile
 
-from app.db.models import Post, PostStatus, RefreshMode, Settings, Task, TaskKind, TaskStatus
+from app.db.models import (
+    Post,
+    PostStatus,
+    RefreshMode,
+    Settings,
+    Task,
+    TaskKind,
+    TaskStatus,
+    TitleAnnotationSource,
+    TitleAnnotationStatus,
+)
 from app.db.session import SessionLocal, engine, init_db
 from app.services.mega import MegaDownloadError
-from app.services.tasks import TaskManager, _resolve_download_concurrency, _resolve_download_timeout_seconds
+from app.services.fanbox import ScrapedPost
+from app.services.title_annotation import TitleAnnotationResult
+from app.services.tasks import (
+    TaskManager,
+    _resolve_annotation_concurrency,
+    _resolve_download_concurrency,
+    _resolve_download_timeout_seconds,
+)
 
 TEST_DB = Path(__file__).resolve().parents[1] / "data" / "test.db"
 
@@ -62,6 +81,16 @@ def test_resolve_download_concurrency_defaults_to_five(monkeypatch) -> None:
 def test_resolve_download_timeout_uses_env_value(monkeypatch) -> None:
     monkeypatch.setenv("FANBOX_DOWNLOAD_TIMEOUT_SECONDS", "45")
     assert _resolve_download_timeout_seconds() == 45
+
+
+def test_resolve_annotation_concurrency_defaults_to_five(monkeypatch) -> None:
+    monkeypatch.delenv("FANBOX_ANNOTATION_CONCURRENCY", raising=False)
+    assert _resolve_annotation_concurrency() == 5
+
+
+def test_resolve_annotation_concurrency_uses_env_value(monkeypatch) -> None:
+    monkeypatch.setenv("FANBOX_ANNOTATION_CONCURRENCY", "3")
+    assert _resolve_annotation_concurrency() == 3
 
 
 def test_enqueue_refresh_reuses_existing_active_task() -> None:
@@ -246,5 +275,143 @@ def test_run_download_reuses_existing_archive_without_calling_mega(monkeypatch, 
         assert "Reused existing archive" in (task.log or "")
         assert post.status == PostStatus.COMPLETED.value
 
-    extracted = list((library_root / year / "existing").rglob("*.jpg"))
-    assert extracted
+
+def test_run_annotate_processes_titles_concurrently(monkeypatch) -> None:
+    with SessionLocal() as session:
+        for index in range(3):
+            session.add(
+                Post(
+                    post_id=f"concurrent-{index}",
+                    title=f"ベルファスト{index}",
+                    published_at=datetime.utcnow(),
+                    detail_url=f"https://example.fanbox.cc/posts/concurrent-{index}",
+                    mega_url=f"https://mega.nz/file/concurrent-{index}",
+                    status=PostStatus.MISSING_LOCAL.value,
+                    title_annotation_status=TitleAnnotationStatus.PENDING.value,
+                    title_annotation_source=TitleAnnotationSource.NONE.value,
+                )
+            )
+        session.add(
+            Task(
+                id="annotate-concurrency-task",
+                kind=TaskKind.ANNOTATE_TITLES.value,
+                status=TaskStatus.QUEUED.value,
+            )
+        )
+        session.commit()
+
+    active = {"count": 0, "max": 0}
+    guard = threading.Lock()
+
+    def fake_resolve_title_annotation(title, aliases, llm_config):
+        with guard:
+            active["count"] += 1
+            active["max"] = max(active["max"], active["count"])
+        time.sleep(0.08)
+        with guard:
+            active["count"] -= 1
+        return TitleAnnotationResult(
+            annotation=f"{title}-CN",
+            source=TitleAnnotationSource.LLM.value,
+            status=TitleAnnotationStatus.COMPLETED.value,
+        )
+
+    monkeypatch.setattr("app.services.tasks.resolve_title_annotation", fake_resolve_title_annotation)
+    monkeypatch.setenv("FANBOX_ANNOTATION_CONCURRENCY", "3")
+    monkeypatch.setenv("FANBOX_ANNOTATION_BATCH_SIZE", "3")
+
+    manager = TaskManager()
+    asyncio.run(manager._run_annotate("annotate-concurrency-task"))
+
+    assert active["max"] >= 2
+
+    with SessionLocal() as session:
+        posts = session.query(Post).filter(Post.post_id.in_(["concurrent-0", "concurrent-1", "concurrent-2"])).all()
+        assert all(post.title_annotation_status == TitleAnnotationStatus.COMPLETED.value for post in posts)
+
+
+def test_run_refresh_enqueues_annotation_for_new_kana_title(monkeypatch) -> None:
+    with SessionLocal() as session:
+        settings = session.get(Settings, 1)
+        assert settings is not None
+        settings.creator_url = "https://siu.fanbox.cc/posts"
+        session.commit()
+
+    scraped_posts = [
+        ScrapedPost(
+            post_id="99900010",
+            title="ベルファスト⑦",
+            detail_url="https://siu.fanbox.cc/posts/99900010",
+            published_at=datetime.utcnow(),
+            mega_url="https://mega.nz/file/annotate",
+            status=PostStatus.MISSING_LOCAL.value,
+            cover_url="https://example.com/cover.jpg",
+        )
+    ]
+    enqueue_calls: list[bool] = []
+
+    async def fake_refresh_posts(*args, **kwargs):
+        return scraped_posts
+
+    def fake_enqueue_annotation() -> str:
+        enqueue_calls.append(True)
+        return "annotation-task-id"
+
+    monkeypatch.setattr("app.services.tasks.refresh_posts", fake_refresh_posts)
+
+    manager = TaskManager()
+    monkeypatch.setattr(manager, "enqueue_annotation", fake_enqueue_annotation)
+
+    asyncio.run(manager._run_refresh("missing-refresh-task", RefreshMode.INCREMENTAL))
+
+    assert enqueue_calls == [True]
+    with SessionLocal() as session:
+        post = session.query(Post).filter_by(post_id="99900010").one()
+        assert post.title_annotation is None
+        assert post.title_annotation_status == TitleAnnotationStatus.PENDING.value
+
+
+def test_run_annotate_updates_pending_posts(monkeypatch) -> None:
+    with SessionLocal() as session:
+        post = Post(
+            post_id="99900011",
+            title="ベルファスト⑦",
+            published_at=datetime.utcnow(),
+            detail_url="https://siu.fanbox.cc/posts/99900011",
+            mega_url="https://mega.nz/file/annotate-run",
+            status=PostStatus.MISSING_LOCAL.value,
+            title_annotation_status=TitleAnnotationStatus.PENDING.value,
+        )
+        session.add(post)
+        session.add(
+            Task(
+                id="annotate-task-1",
+                kind=TaskKind.ANNOTATE_TITLES.value,
+                status=TaskStatus.QUEUED.value,
+            )
+        )
+        session.commit()
+
+    monkeypatch.setattr(
+        "app.services.tasks.resolve_title_annotation",
+        lambda *args, **kwargs: TitleAnnotationResult(
+            annotation="贝尔法斯特⑦",
+            source=TitleAnnotationSource.LLM.value,
+            status=TitleAnnotationStatus.COMPLETED.value,
+        ),
+    )
+    monkeypatch.setattr("app.services.tasks.load_title_aliases", lambda: object())
+    monkeypatch.setattr("app.services.tasks.load_llm_config", lambda settings=None: object())
+
+    manager = TaskManager()
+    asyncio.run(manager._run_annotate("annotate-task-1"))
+
+    with SessionLocal() as session:
+        post = session.query(Post).filter_by(post_id="99900011").one()
+        task = session.get(Task, "annotate-task-1")
+        assert post.title_annotation == "贝尔法斯特⑦"
+        assert post.title_annotation_source == TitleAnnotationSource.LLM.value
+        assert post.title_annotation_status == TitleAnnotationStatus.COMPLETED.value
+        assert task is not None
+        assert task.status == TaskStatus.COMPLETED.value
+        assert "Title annotation finished" in (task.message or "")

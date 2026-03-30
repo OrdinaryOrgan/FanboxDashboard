@@ -8,6 +8,9 @@ export type Post = {
   id: number
   post_id: string
   title: string
+  title_annotation: string | null
+  has_title_annotation: boolean
+  display_title: string
   published_at: string | null
   detail_url: string
   cover_url: string | null
@@ -17,6 +20,7 @@ export type Post = {
   archive_path: string | null
   extract_dir: string | null
   can_open_local_path: boolean
+  needs_title_annotation: boolean
   updated_at: string
 }
 
@@ -48,6 +52,11 @@ export type Settings = {
   download_concurrency: number
   posts_per_row: number
   auto_delete_archive: boolean
+  llm_enabled: boolean
+  llm_api_key: string
+  llm_base_url: string
+  llm_model: string
+  title_aliases_path: string
 }
 
 export type AuthStatus = {
@@ -76,4 +85,29 @@ export type ArchiveActionResult = {
 
 export type OpenPathResult = {
   opened_path: string
+}
+
+export type TitleAliasesClearResult = {
+  cleared_path: string
+}
+
+export type TitleAnnotationCacheClearResult = {
+  reset_count: number
+}
+
+export type TitleAliasEntry = {
+  source: string
+  target: string
+}
+
+export type TitleAliasUpsertRequest = {
+  post_id: string
+  mode: 'full_title' | 'phrase_fragment' | 'fragment'
+  full_title_translation?: string
+  entries: TitleAliasEntry[]
+}
+
+export type TitleAliasUpsertResult = {
+  updated_count: number
+  aliases_path: string
 }

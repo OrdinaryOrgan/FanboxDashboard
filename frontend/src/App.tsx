@@ -13,12 +13,14 @@ import {
   Layout,
   Modal,
   Popconfirm,
+  Radio,
   Select,
   Slider,
   Space,
   Switch,
   Table,
   Tag,
+  Tooltip,
   Typography,
 } from 'antd'
 import type { ColumnsType } from 'antd/es/table'
@@ -28,6 +30,7 @@ import {
   CheckOutlined,
   CheckCircleFilled,
   ClockCircleOutlined,
+  PlusOutlined,
   DownloadOutlined,
   EllipsisOutlined,
   EyeInvisibleOutlined,
@@ -37,6 +40,7 @@ import {
   LoginOutlined,
   MoonOutlined,
   ReloadOutlined,
+  RobotOutlined,
   RightOutlined,
   SettingOutlined,
   SunOutlined,
@@ -49,7 +53,7 @@ import dayjs from 'dayjs'
 import utc from 'dayjs/plugin/utc'
 
 import { api } from './api'
-import type { Post, RefreshMode, Settings, Task } from './types'
+import type { Post, RefreshMode, Settings, Task, TitleAliasUpsertRequest } from './types'
 
 dayjs.extend(utc)
 
@@ -88,10 +92,19 @@ const POST_STATUS_META: Record<string, { label: string; tone: string }> = {
   new: { label: '新发现', tone: 'neutral' },
 }
 
-type Panel = 'settings' | 'archive' | null
+type Panel = 'settings' | 'archive' | 'llm' | null
 type ThemeMode = 'light' | 'dark'
 type SettingsFormValues = Settings & {
   follow_system_theme: boolean
+}
+type TitleAliasMode = 'full_title' | 'phrase_fragment' | 'fragment'
+type TitleAliasFormValues = {
+  mode: TitleAliasMode
+  full_title_translation?: string
+  entries: {
+    source: string
+    target: string
+  }[]
 }
 type AppProps = {
   resolvedThemeMode: ThemeMode
@@ -112,6 +125,7 @@ const ACTIVE_TASK_STATUSES = new Set([
   'running_extract',
   'running_rename',
   'running_refresh',
+  'running_annotate',
   'running_login',
 ])
 const toLocalTime = (value: string | null) => {
@@ -132,11 +146,17 @@ const clampTaskDrawerWidth = (width: number) => {
   return Math.min(max, Math.max(min, width))
 }
 const hasActiveTask = (task: Task) => ACTIVE_TASK_STATUSES.has(task.status)
+const hasActiveAnnotationTask = (task: Task) =>
+  task.kind === 'annotate_titles' && ['queued', 'running_annotate'].includes(task.status)
 const getTasksRefetchInterval = (isDrawerOpen: boolean, currentTasks: Task[] | undefined) => {
   const hasActiveTasks = currentTasks?.some(hasActiveTask) ?? false
 
   if (hasActiveTasks) return isDrawerOpen ? 3_000 : 8_000
   return isDrawerOpen ? 15_000 : 30_000
+}
+const getPostsRefetchInterval = (currentTasks: Task[] | undefined) => {
+  const hasAnnotationTasks = currentTasks?.some(hasActiveAnnotationTask) ?? false
+  return hasAnnotationTasks ? 4_000 : 30_000
 }
 const getOptimalTaskDrawerPageSize = () => {
   if (typeof window === 'undefined') return 10
@@ -147,6 +167,7 @@ function getTaskKindLabel(task: Task) {
   if (task.kind === 'refresh_posts') {
     return task.refresh_mode === 'full' ? '全量校准' : '增量刷新'
   }
+  if (task.kind === 'annotate_titles') return '标题补注'
   if (task.kind === 'rescan_library') return '本地扫描'
   if (task.kind === 'download_post') return '补档帖子'
   if (task.kind === 'open_login') return '打开登录窗口'
@@ -158,6 +179,7 @@ function getTaskKindLabel(task: Task) {
 function getTaskStatusLabel(task: Task) {
   if (task.status === 'queued') {
     if (task.kind === 'refresh_posts') return '等待刷新'
+    if (task.kind === 'annotate_titles') return '等待补注'
     if (task.kind === 'rescan_library') return '等待扫描'
     if (task.kind === 'download_post') return '等待下载'
     if (task.kind === 'extract_archive') return '等待解压'
@@ -170,6 +192,7 @@ function getTaskStatusLabel(task: Task) {
     if (task.kind === 'rescan_library') return '扫描中'
     return '刷新中'
   }
+  if (task.status === 'running_annotate') return '补注中'
   if (task.status === 'running_download') return '下载中'
   if (task.status === 'running_extract') return '解压中'
   if (task.status === 'running_rename') return '整理中'
@@ -177,6 +200,7 @@ function getTaskStatusLabel(task: Task) {
   if (task.status === 'failed_download') return '下载失败'
   if (task.status === 'failed_extract') return '解压失败'
   if (task.status === 'failed_rename') return '整理失败'
+  if (task.status === 'failed_annotate') return '补注失败'
   if (task.status === 'failed_auth') return '登录失败'
   if (task.status === 'failed_parse') {
     if (task.kind === 'rescan_library') return '扫描失败'
@@ -208,6 +232,13 @@ function getTaskProgressLabel(task: Task) {
     if (task.status === 'completed') return '本地扫描完成'
     if (task.status.startsWith('failed')) return '本地扫描失败'
     return '正在扫描本地图库'
+  }
+
+  if (task.kind === 'annotate_titles') {
+    if (task.status === 'queued') return '等待生成标题补注'
+    if (task.status === 'completed') return '标题补注完成'
+    if (task.status === 'running_annotate') return '正在生成标题补注'
+    if (task.status === 'failed_annotate') return '标题补注失败'
   }
 
   if (task.kind === 'download_post') {
@@ -382,7 +413,9 @@ export default function App({
   const { message } = AntdApp.useApp()
   const queryClient = useQueryClient()
   const [form] = Form.useForm<SettingsFormValues>()
+  const [titleAliasForm] = Form.useForm<TitleAliasFormValues>()
   const [panel, setPanel] = useState<Panel>(null)
+  const [titleAliasModalPost, setTitleAliasModalPost] = useState<Post | null>(null)
   const [tasksOpen, setTasksOpen] = useState(false)
   const [purgeYear, setPurgeYear] = useState<string>()
   const [selectedYear, setSelectedYear] = useState<string>()
@@ -413,6 +446,7 @@ export default function App({
   const backGridRef = useRef<HTMLDivElement | null>(null)
   const delayedSettingsSyncRef = useRef<number | null>(null)
   const taskDrawerResizeCleanupRef = useRef<(() => void) | null>(null)
+  const titleAliasMode = Form.useWatch('mode', titleAliasForm) ?? 'full_title'
 
   useEffect(() => {
     document.documentElement.dataset.theme = resolvedThemeMode
@@ -465,15 +499,15 @@ export default function App({
     return promise
   }
 
-  const postsQuery = useQuery({
-    queryKey: ['posts'],
-    queryFn: api.getPosts,
-    refetchInterval: 30_000,
-  })
   const tasksQuery = useQuery({
     queryKey: ['tasks'],
     queryFn: api.getTasks,
     refetchInterval: (query) => getTasksRefetchInterval(tasksOpen, query.state.data as Task[] | undefined),
+  })
+  const postsQuery = useQuery({
+    queryKey: ['posts'],
+    queryFn: api.getPosts,
+    refetchInterval: () => getPostsRefetchInterval(tasksQuery.data as Task[] | undefined),
   })
   const settingsQuery = useQuery({
     queryKey: ['settings'],
@@ -596,6 +630,51 @@ export default function App({
     },
   })
 
+  const openTitleAliasesPathMutation = useMutation({
+    mutationFn: api.openTitleAliasesPath,
+    onSuccess: () => {
+      message.success('已打开词库路径')
+    },
+    onError: (error) => {
+      message.error(error instanceof Error ? error.message : '打开词库路径失败')
+    },
+  })
+
+  const clearTitleAliasesMutation = useMutation({
+    mutationFn: api.clearTitleAliases,
+    onSuccess: async () => {
+      message.success('已清空词库')
+      await queryClient.invalidateQueries({ queryKey: ['posts'] })
+    },
+    onError: (error) => {
+      message.error(error instanceof Error ? error.message : '清空词库失败')
+    },
+  })
+
+  const clearTitleAnnotationCacheMutation = useMutation({
+    mutationFn: api.clearTitleAnnotationCache,
+    onSuccess: async (data) => {
+      message.success(data.reset_count > 0 ? `已清空 ${data.reset_count} 条补注缓存` : '补注缓存已清空')
+      await queryClient.invalidateQueries({ queryKey: ['posts'] })
+    },
+    onError: (error) => {
+      message.error(error instanceof Error ? error.message : '清空补注缓存失败')
+    },
+  })
+
+  const upsertTitleAliasesMutation = useMutation({
+    mutationFn: api.upsertTitleAliases,
+    onSuccess: async (data) => {
+      message.success(data.updated_count > 0 ? `已写入 ${data.updated_count} 条词库映射` : '已保存词库设置')
+      setTitleAliasModalPost(null)
+      titleAliasForm.resetFields()
+      await queryClient.invalidateQueries({ queryKey: ['posts'] })
+    },
+    onError: (error) => {
+      message.error(error instanceof Error ? error.message : '保存本地词库失败')
+    },
+  })
+
   const purgeArchiveMutation = useMutation({
     mutationFn: api.purgeArchives,
     onSuccess: async (data) => {
@@ -622,6 +701,53 @@ export default function App({
     }, FLOATING_PANEL_EXIT_DELAY_MS)
   },
   })
+
+  const openTitleAliasModal = (post: Post) => {
+    titleAliasForm.setFieldsValue({
+      mode: 'full_title',
+      full_title_translation: '',
+      entries: [{ source: '', target: '' }],
+    })
+    setTitleAliasModalPost(post)
+  }
+
+  const closeTitleAliasModal = () => {
+    setTitleAliasModalPost(null)
+    titleAliasForm.resetFields()
+  }
+
+  const handleCopyTitle = async (title: string) => {
+    try {
+      await copyTextToClipboard(title)
+      message.success('宸插鍒跺師濮嬫爣棰?')
+    } catch {
+      message.error('澶嶅埗鏍囬澶辫触')
+    }
+  }
+
+  const handleSaveTitleAlias = (values: TitleAliasFormValues) => {
+    if (!titleAliasModalPost) return
+
+    const payload: TitleAliasUpsertRequest = {
+      post_id: titleAliasModalPost.post_id,
+      mode: values.mode,
+      full_title_translation: undefined,
+      entries: [],
+    }
+
+    if (values.mode === 'full_title') {
+      payload.full_title_translation = values.full_title_translation?.trim() ?? ''
+    } else {
+      payload.entries = (values.entries ?? [])
+        .map((entry) => ({
+          source: entry.source.trim(),
+          target: entry.target.trim(),
+        }))
+        .filter((entry) => entry.source && entry.target)
+    }
+
+    upsertTitleAliasesMutation.mutate(payload)
+  }
 
   const posts = postsQuery.data ?? []
   const tasks = tasksQuery.data ?? []
@@ -939,6 +1065,7 @@ export default function App({
   const menuItems: MenuProps['items'] = [
     { key: 'settings', label: '设置', icon: <SettingOutlined /> },
     { key: 'archive', label: 'Archive 清理', icon: <FolderOpenOutlined /> },
+    { key: 'llm', label: '标题补注', icon: <RobotOutlined /> },
     { key: 'tasks', label: '任务队列', icon: <UnorderedListOutlined /> },
     { type: 'divider' },
     { key: 'login', label: '打开登录窗口', icon: <LoginOutlined /> },
@@ -947,6 +1074,7 @@ export default function App({
   const handleMenuClick: MenuProps['onClick'] = ({ key }) => {
     if (key === 'settings') setPanel('settings')
     if (key === 'archive') setPanel('archive')
+    if (key === 'llm') setPanel('llm')
     if (key === 'tasks') setTasksOpen(true)
     if (key === 'login') loginMutation.mutate()
   }
@@ -1096,7 +1224,13 @@ export default function App({
   } as CSSProperties
 
   const handleSaveSettings = (values: SettingsFormValues) => {
-    const { follow_system_theme, ...settingsPayload } = values
+    const baseSettings = settingsQuery.data
+    if (!baseSettings) {
+      message.error('设置尚未加载完成，请稍后再试')
+      return
+    }
+    const mergedValues = { ...baseSettings, ...values }
+    const { follow_system_theme, ...settingsPayload } = mergedValues
     onFollowSystemThemeChange(follow_system_theme)
     saveSettingsMutation.mutate(settingsPayload)
   }
@@ -1158,6 +1292,7 @@ export default function App({
     const isDownloadPending =
       downloadMutation.isPending && downloadingPostId != null && downloadingPostId === String(record.post_id)
     const downloadButtonState = getPostDownloadButtonState(record.status, isDownloadPending, Boolean(record.mega_url))
+    const displayTitle = record.display_title || record.title
 
     return (
       <article className={`post-tile${privacyMode ? ' is-private' : ''}`} key={record.post_id}>
@@ -1166,31 +1301,29 @@ export default function App({
           href={record.detail_url}
           target="_blank"
           rel="noreferrer"
-          aria-label={record.title}
+          aria-label={displayTitle}
         >
           {privacyMode ? (
             <div className="post-cover-private">
-              <div className="post-cover-private-title" title={record.title}>
-                {record.title}
+              <div className="post-cover-private-title" title={displayTitle}>
+                {displayTitle}
               </div>
             </div>
           ) : record.cover_url ? (
-            <img className="post-cover-image" src={record.cover_url} alt={record.title} loading="eager" />
+            <img className="post-cover-image" src={record.cover_url} alt={displayTitle} loading="eager" />
           ) : (
             <div className="post-cover-placeholder">
-              <span>{record.title.slice(0, 1).toUpperCase()}</span>
+              <span>{displayTitle.slice(0, 1).toUpperCase()}</span>
             </div>
           )}
         </a>
         <div className={`post-tile-footer${privacyMode ? ' is-private' : ''}`}>
           <div className="post-meta">
-            <div
-              className={`post-tile-title${privacyMode ? ' is-hidden' : ''}`}
-              title={privacyMode ? undefined : record.title}
-              aria-hidden={privacyMode}
-            >
-              {record.title}
-            </div>
+            <Tooltip title={privacyMode ? null : displayTitle}>
+              <div className={`post-tile-title${privacyMode ? ' is-hidden' : ''}`} aria-hidden={privacyMode}>
+                {displayTitle}
+              </div>
+            </Tooltip>
             <div className="post-bottom-row">
               <div className="post-tile-date">{formatPostDate(record.published_at)}</div>
               <div className="post-actions">
@@ -1219,6 +1352,7 @@ export default function App({
                 ) : null}
                 <Dropdown
                   trigger={['click']}
+                  overlayClassName="post-actions-menu-overlay"
                   menu={{
                     items: [
                       {
@@ -1227,12 +1361,18 @@ export default function App({
                         disabled: !record.can_open_local_path,
                       },
                       {
+                        key: 'add-title-alias',
+                        label: '添加词条',
+                        disabled: !record.needs_title_annotation,
+                      },
+                      {
                         key: 'delete-archive',
                         label: '删除本地压缩包',
                         disabled: !record.archive_path,
                       },
                     ],
                     onClick: ({ key }) => {
+                      if (key === 'add-title-alias') openTitleAliasModal(record)
                       if (key === 'open-local-path') openLocalPathMutation.mutate(record.post_id)
                       if (key === 'delete-archive') deleteArchiveMutation.mutate(record.post_id)
                     },
@@ -1733,6 +1873,227 @@ export default function App({
             </div>
           </div>
         </Space>
+      </Modal>
+
+      <Modal
+        centered
+        open={Boolean(titleAliasModalPost)}
+        onCancel={closeTitleAliasModal}
+        footer={null}
+        width={720}
+        className="floating-panel-modal title-alias-modal"
+        transitionName="floating-panel-motion"
+        maskTransitionName="floating-panel-mask-motion"
+        title={
+          <div className="floating-panel-title">
+            <span className="floating-panel-title-text">添加词条</span>
+          </div>
+        }
+      >
+        <Form<TitleAliasFormValues>
+          form={titleAliasForm}
+          layout="vertical"
+          onFinish={handleSaveTitleAlias}
+          initialValues={{
+            mode: 'full_title',
+            full_title_translation: '',
+            entries: [{ source: '', target: '' }],
+          }}
+        >
+          <div className="settings-layout title-alias-layout">
+            <section className="settings-section title-alias-source-section">
+              <div className="settings-section-header">
+                <Text className="settings-section-kicker">标题原文</Text>
+              </div>
+              <div className="title-alias-source-row">
+                <div className="title-alias-source-display">{titleAliasModalPost?.title ?? ''}</div>
+                <Button className="title-alias-neutral-button" onClick={() => titleAliasModalPost && handleCopyTitle(titleAliasModalPost.title)}>
+                  复制原文
+                </Button>
+              </div>
+            </section>
+
+            <section className="settings-section title-alias-entry-section">
+              <div className="settings-section-header">
+                <Text className="settings-section-kicker">词条设置</Text>
+              </div>
+              <div className="title-alias-config-stack">
+                <Form.Item name="mode" label="补注方式" rules={[{ required: true }]}>
+                  <Radio.Group className="title-alias-mode-group">
+                    <Radio value="full_title">整条补注</Radio>
+                    <Radio value="phrase_fragment">短语补注</Radio>
+                    <Radio value="fragment">单词补注</Radio>
+                  </Radio.Group>
+                </Form.Item>
+
+                {titleAliasMode === 'full_title' ? (
+                  <Form.Item
+                    name="full_title_translation"
+                    label="整条补注"
+                    rules={[{ required: true, message: '请输入整条补注' }]}
+                  >
+                    <Input placeholder="填写整条标题的中文" />
+                  </Form.Item>
+                ) : (
+                  <Form.List name="entries">
+                    {(fields, { add, remove }) => (
+                      <div className="title-alias-entry-list">
+                        {fields.map((field, index) => (
+                          <div key={field.key} className="title-alias-entry-row">
+                            <Form.Item
+                              {...field}
+                              label={index === 0 ? '原文' : undefined}
+                              name={[field.name, 'source']}
+                              className="title-alias-entry-field"
+                              rules={[{ required: true, message: '请输入原文' }]}
+                            >
+                              <Input placeholder={titleAliasMode === 'phrase_fragment' ? '填写短语' : '填写单词'} />
+                            </Form.Item>
+                            <Form.Item
+                              {...field}
+                              label={index === 0 ? '中文' : undefined}
+                              name={[field.name, 'target']}
+                              className="title-alias-entry-field"
+                              rules={[{ required: true, message: '请输入中文' }]}
+                            >
+                              <Input placeholder="填写中文" />
+                            </Form.Item>
+                            <div className={`title-alias-entry-remove-wrap${index === 0 ? ' has-label' : ''}`}>
+                              {index === 0 ? <span className="title-alias-entry-remove-label">操作</span> : null}
+                              <Button
+                                className="title-alias-entry-remove archive-danger-button"
+                                danger
+                                disabled={fields.length === 1}
+                                onClick={() => remove(field.name)}
+                              >
+                                删除
+                              </Button>
+                            </div>
+                          </div>
+                        ))}
+                        <div className="settings-section-actions floating-panel-button-group title-alias-entry-actions">
+                          <Button
+                            className="title-alias-add-button title-alias-neutral-button"
+                            icon={<PlusOutlined />}
+                            onClick={() => add({ source: '', target: '' })}
+                          >
+                            新增一组词条
+                          </Button>
+                        </div>
+                      </div>
+                    )}
+                  </Form.List>
+                )}
+              </div>
+            </section>
+          </div>
+
+            <div className="floating-panel-actions">
+              <div className="floating-panel-button-group">
+                <Button type="primary" htmlType="submit" loading={upsertTitleAliasesMutation.isPending}>
+                  保存词条
+                </Button>
+              </div>
+            </div>
+        </Form>
+      </Modal>
+
+      <Modal
+        centered
+        open={panel === 'llm'}
+        onCancel={() => setPanel(null)}
+        footer={null}
+        width={680}
+        className="floating-panel-modal"
+        transitionName="floating-panel-motion"
+        maskTransitionName="floating-panel-mask-motion"
+        title={
+          <div className="floating-panel-title">
+            <span className="floating-panel-title-text">标题补注</span>
+          </div>
+        }
+      >
+        <Form<SettingsFormValues>
+          form={form}
+          layout="vertical"
+          onFinish={handleSaveSettings}
+          initialValues={settingsQuery.data}
+        >
+          <div className="settings-layout llm-settings-layout">
+            <section className="settings-section settings-section-llm">
+              <div className="settings-section-header">
+                <Text className="settings-section-kicker">补注模型</Text>
+              </div>
+              <div className="settings-grid">
+                <Form.Item name="llm_enabled" label="启用标题补注" valuePropName="checked">
+                  <Switch checkedChildren="开启" unCheckedChildren="关闭" />
+                </Form.Item>
+                <Form.Item
+                  name="llm_api_key"
+                  label="接口密钥"
+                  tooltip="只保存在本机设置中，不会写入代码仓库。"
+                >
+                  <Input.Password placeholder="输入本机调试用接口密钥" autoComplete="off" />
+                </Form.Item>
+                <Form.Item name="llm_base_url" label="接口地址" rules={[{ required: true }]}>
+                  <Input placeholder="https://api.deepseek.com" />
+                </Form.Item>
+                <Form.Item name="llm_model" label="模型名称" rules={[{ required: true }]}>
+                  <Input placeholder="deepseek-chat" />
+                </Form.Item>
+              </div>
+            </section>
+            <section className="settings-section settings-section-aliases">
+              <div className="settings-section-header">
+                <Text className="settings-section-kicker">本地词库</Text>
+              </div>
+              <div className="settings-grid settings-grid-single">
+                <Form.Item name="title_aliases_path" label="词库文件路径" rules={[{ required: true }]}>
+                  <Input placeholder="C:\\path\\to\\title_aliases.json" />
+                </Form.Item>
+              </div>
+              <div className="settings-section-actions floating-panel-button-group">
+                <Button
+                  className="llm-neutral-button"
+                  icon={<FolderOpenOutlined />}
+                  loading={openTitleAliasesPathMutation.isPending}
+                  onClick={() => openTitleAliasesPathMutation.mutate()}
+                >
+                  打开词库路径
+                </Button>
+                <Popconfirm
+                  title="清空词库？"
+                  description="会清空已保存的词库内容。此操作不可撤销。"
+                  okText="清空"
+                  cancelText="取消"
+                  onConfirm={() => clearTitleAliasesMutation.mutate()}
+                >
+                  <Button className="archive-danger-button" danger loading={clearTitleAliasesMutation.isPending}>
+                    清空词库
+                  </Button>
+                </Popconfirm>
+              </div>
+            </section>
+          </div>
+          <div className="floating-panel-actions">
+            <div className="floating-panel-button-group">
+              <Popconfirm
+                title="清空补注缓存？"
+                description="会清空已有的补注缓存，并将需要补注的帖子重置为待处理。"
+                okText="清空"
+                cancelText="取消"
+                onConfirm={() => clearTitleAnnotationCacheMutation.mutate()}
+              >
+                <Button className="archive-danger-button" danger loading={clearTitleAnnotationCacheMutation.isPending}>
+                  清空补注缓存
+                </Button>
+              </Popconfirm>
+              <Button type="primary" htmlType="submit" loading={saveSettingsMutation.isPending}>
+                保存设置
+              </Button>
+            </div>
+          </div>
+        </Form>
       </Modal>
 
       <Drawer

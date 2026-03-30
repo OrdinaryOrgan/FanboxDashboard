@@ -6,7 +6,7 @@ from sqlalchemy import create_engine, inspect, text
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.core.config import get_config
-from app.db.models import Base, Settings
+from app.db.models import Base, Settings, TitleAnnotationStatus
 
 
 config = get_config()
@@ -36,6 +36,10 @@ def init_db() -> None:
                     download_concurrency=5,
                     posts_per_row=4,
                     auto_delete_archive=True,
+                    llm_enabled=False,
+                    llm_base_url="https://api.deepseek.com",
+                    llm_model="deepseek-chat",
+                    title_aliases_path=str(config.project_root / "backend" / "app" / "core" / "title_aliases.json"),
                 )
             )
             session.commit()
@@ -64,10 +68,47 @@ def _apply_runtime_migrations() -> None:
             connection.execute(text("ALTER TABLE settings ADD COLUMN download_concurrency INTEGER NOT NULL DEFAULT 5"))
         if "posts_per_row" not in columns:
             connection.execute(text("ALTER TABLE settings ADD COLUMN posts_per_row INTEGER NOT NULL DEFAULT 4"))
+        if "llm_enabled" not in columns:
+            connection.execute(text("ALTER TABLE settings ADD COLUMN llm_enabled BOOLEAN NOT NULL DEFAULT 0"))
+        if "llm_api_key" not in columns:
+            connection.execute(text("ALTER TABLE settings ADD COLUMN llm_api_key VARCHAR(500)"))
+        if "llm_base_url" not in columns:
+            connection.execute(
+                text(
+                    "ALTER TABLE settings ADD COLUMN llm_base_url VARCHAR(500) "
+                    "NOT NULL DEFAULT 'https://api.deepseek.com'"
+                )
+            )
+        if "llm_model" not in columns:
+            connection.execute(
+                text("ALTER TABLE settings ADD COLUMN llm_model VARCHAR(100) NOT NULL DEFAULT 'deepseek-chat'")
+            )
+        if "title_aliases_path" not in columns:
+            connection.execute(text("ALTER TABLE settings ADD COLUMN title_aliases_path VARCHAR(500) NOT NULL DEFAULT ''"))
+    with SessionLocal() as session:
+        settings = session.get(Settings, 1)
+        if settings is not None and not settings.title_aliases_path:
+            settings.title_aliases_path = str(config.project_root / "backend" / "app" / "core" / "title_aliases.json")
+            session.commit()
     post_columns = {column["name"] for column in inspector.get_columns("posts")} if "posts" in inspector.get_table_names() else set()
     with engine.begin() as connection:
         if "cover_url" not in post_columns:
             connection.execute(text("ALTER TABLE posts ADD COLUMN cover_url VARCHAR(1000)"))
+        if "title_annotation" not in post_columns:
+            connection.execute(text("ALTER TABLE posts ADD COLUMN title_annotation VARCHAR(500)"))
+        if "title_annotation_source" not in post_columns:
+            connection.execute(text("ALTER TABLE posts ADD COLUMN title_annotation_source VARCHAR(50)"))
+        if "title_annotation_status" not in post_columns:
+            connection.execute(
+                text(
+                    "ALTER TABLE posts ADD COLUMN title_annotation_status VARCHAR(30) NOT NULL DEFAULT "
+                    f"'{TitleAnnotationStatus.PENDING.value}'"
+                )
+            )
+        if "title_annotation_error" not in post_columns:
+            connection.execute(text("ALTER TABLE posts ADD COLUMN title_annotation_error TEXT"))
+        if "title_annotation_updated_at" not in post_columns:
+            connection.execute(text("ALTER TABLE posts ADD COLUMN title_annotation_updated_at DATETIME"))
     task_columns = {column["name"] for column in inspector.get_columns("tasks")} if "tasks" in inspector.get_table_names() else set()
     with engine.begin() as connection:
         if "progress_current" not in task_columns:

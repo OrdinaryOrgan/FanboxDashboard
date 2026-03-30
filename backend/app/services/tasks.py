@@ -8,7 +8,18 @@ from uuid import uuid4
 
 from sqlalchemy.orm import Session
 
-from app.db.models import Artifact, Post, PostStatus, RefreshMode, Settings, Task, TaskKind, TaskStatus
+from app.db.models import (
+    Artifact,
+    Post,
+    PostStatus,
+    RefreshMode,
+    Settings,
+    Task,
+    TaskKind,
+    TaskStatus,
+    TitleAnnotationSource,
+    TitleAnnotationStatus,
+)
 from app.db.session import SessionLocal
 from app.services.fanbox import ExistingPostSnapshot, FanboxAuthError, open_login_window, refresh_posts
 from app.services.files import (
@@ -22,6 +33,14 @@ from app.services.files import (
     serialize_processed_files,
 )
 from app.services.mega import MegaDownloadError, download_public_link
+from app.services.title_annotation import (
+    TitleAnnotationResult,
+    find_completed_annotation_for_same_title,
+    load_llm_config,
+    load_title_aliases,
+    prepare_post_title_annotation,
+    resolve_title_annotation,
+)
 
 
 class TaskManager:
@@ -37,6 +56,7 @@ class TaskManager:
             TaskStatus.RUNNING_EXTRACT.value,
             TaskStatus.RUNNING_RENAME.value,
             TaskStatus.RUNNING_REFRESH.value,
+            TaskStatus.RUNNING_ANNOTATE.value,
             TaskStatus.RUNNING_LOGIN.value,
         ]
         with SessionLocal() as session:
@@ -76,6 +96,21 @@ class TaskManager:
         self._running_tasks[task_id] = asyncio.create_task(self._run_login(task_id))
         return task_id
 
+    def enqueue_annotation(self) -> str:
+        with SessionLocal() as session:
+            active_task = self._find_active_annotation_task(session)
+            if active_task is not None:
+                return active_task.id
+            pending_count = (
+                session.query(Post).filter(Post.title_annotation_status == TitleAnnotationStatus.PENDING.value).count()
+            )
+            if pending_count == 0:
+                return ""
+
+        task_id = self._create_task(TaskKind.ANNOTATE_TITLES)
+        self._running_tasks[task_id] = asyncio.create_task(self._run_annotate(task_id))
+        return task_id
+
     def enqueue_downloads(self, post_ids: list[str]) -> list[str]:
         created: list[str] = []
         with SessionLocal() as session:
@@ -103,6 +138,8 @@ class TaskManager:
             if task.kind == TaskKind.REFRESH_POSTS.value:
                 refresh_mode = RefreshMode(task.refresh_mode or RefreshMode.INCREMENTAL.value)
                 return self.enqueue_refresh(refresh_mode)
+            if task.kind == TaskKind.ANNOTATE_TITLES.value:
+                return self.enqueue_annotation()
             if task.kind == TaskKind.OPEN_LOGIN.value:
                 return self.enqueue_login()
             if task.kind == TaskKind.RESCAN_LIBRARY.value:
@@ -161,6 +198,7 @@ class TaskManager:
             with SessionLocal() as session:
                 settings = session.get(Settings, 1)
                 assert settings is not None
+                pending_annotation_count = 0
                 for item in scraped_posts:
                     remote_changed = False
                     existing = session.query(Post).filter_by(post_id=item.post_id).one_or_none()
@@ -181,9 +219,13 @@ class TaskManager:
                     else:
                         remote_changed = self._apply_remote_post_updates(existing, item)
 
+                    if prepare_post_title_annotation(existing, force_reset=remote_changed):
+                        pending_annotation_count += 1
                     if remote_changed:
                         self._sync_local_status(session, settings, existing)
                 session.commit()
+            if pending_annotation_count:
+                self.enqueue_annotation()
             with SessionLocal() as session:
                 task = session.get(Task, task_id)
                 progress_current = task.progress_current if task is not None else None
@@ -208,6 +250,125 @@ class TaskManager:
             self._mark_failed(task_id, TaskStatus.FAILED_PARSE.value, str(exc))
         finally:
             self._running_tasks.pop(task_id, None)
+
+    async def _run_annotate(self, task_id: str) -> None:
+        try:
+            self._mark_started(task_id, TaskStatus.RUNNING_ANNOTATE.value, "Annotating titles.")
+            with SessionLocal() as session:
+                settings = session.get(Settings, 1)
+                assert settings is not None
+                aliases = load_title_aliases(settings=settings)
+                llm_config = load_llm_config(settings)
+            local_cache: dict[str, TitleAnnotationResult] = {}
+            annotation_concurrency = _resolve_annotation_concurrency()
+            processed = 0
+            completed = 0
+            skipped = 0
+            failed = 0
+
+            while True:
+                with SessionLocal() as session:
+                    posts = (
+                        session.query(Post)
+                        .filter(Post.title_annotation_status == TitleAnnotationStatus.PENDING.value)
+                        .order_by(Post.updated_at.desc(), Post.id.desc())
+                        .limit(_resolve_annotation_batch_size())
+                        .all()
+                    )
+                    if not posts:
+                        break
+
+                    batch_results: dict[int, TitleAnnotationResult] = {}
+                    unresolved_titles: list[str] = []
+                    for post in posts:
+                        cached_result = local_cache.get(post.title)
+                        if cached_result is None:
+                            cached_result = find_completed_annotation_for_same_title(session, post)
+                        if cached_result is None:
+                            unresolved_titles.append(post.title)
+                            continue
+                        local_cache[post.title] = cached_result
+                        batch_results[post.id] = cached_result
+
+                    unique_unresolved_titles = list(dict.fromkeys(unresolved_titles))
+                    if unique_unresolved_titles:
+                        resolved_results = await self._resolve_annotation_batch(
+                            unique_unresolved_titles,
+                            aliases,
+                            llm_config,
+                            annotation_concurrency,
+                        )
+                        local_cache.update(resolved_results)
+
+                    for post in posts:
+                        cached_result = batch_results.get(post.id) or local_cache.get(post.title)
+                        if cached_result is None:
+                            cached_result = TitleAnnotationResult(
+                                annotation=None,
+                                source=TitleAnnotationSource.NONE.value,
+                                status=TitleAnnotationStatus.FAILED.value,
+                                error="Title annotation result was missing after batch processing.",
+                            )
+                        self._apply_annotation_result(post, cached_result)
+
+                        processed += 1
+                        if cached_result.status == TitleAnnotationStatus.COMPLETED.value:
+                            completed += 1
+                        elif cached_result.status == TitleAnnotationStatus.SKIPPED.value:
+                            skipped += 1
+                        else:
+                            failed += 1
+
+                    session.commit()
+
+                self._update_task_status(
+                    task_id,
+                    TaskStatus.RUNNING_ANNOTATE.value,
+                    (
+                        "Annotating titles. "
+                        f"Processed {processed}, completed {completed}, skipped {skipped}, failed {failed}."
+                    ),
+                )
+
+            self._mark_completed(
+                task_id,
+                (
+                    "Title annotation finished. "
+                    f"Processed {processed}, completed {completed}, skipped {skipped}, failed {failed}."
+                ),
+            )
+        except Exception as exc:
+            self._mark_failed(task_id, TaskStatus.FAILED_ANNOTATE.value, str(exc))
+        finally:
+            self._running_tasks.pop(task_id, None)
+
+    async def _resolve_annotation_batch(
+        self,
+        titles: list[str],
+        aliases,
+        llm_config,
+        concurrency: int,
+    ) -> dict[str, TitleAnnotationResult]:
+        semaphore = asyncio.Semaphore(max(1, concurrency))
+
+        async def resolve_one(title: str) -> tuple[str, TitleAnnotationResult]:
+            async with semaphore:
+                try:
+                    result = await asyncio.wait_for(
+                        asyncio.to_thread(resolve_title_annotation, title, aliases, llm_config),
+                        timeout=_resolve_annotation_timeout_seconds(),
+                    )
+                except TimeoutError:
+                    result = TitleAnnotationResult(
+                        annotation=None,
+                        source=TitleAnnotationSource.NONE.value,
+                        status=TitleAnnotationStatus.FAILED.value,
+                        error=f"Title annotation timed out after {_resolve_annotation_timeout_seconds()} seconds.",
+                    )
+                return title, result
+
+        resolved_pairs = await asyncio.gather(*(resolve_one(title) for title in titles))
+        return dict(resolved_pairs)
 
     async def _run_login(self, task_id: str) -> None:
         try:
@@ -392,12 +553,30 @@ class TaskManager:
             post.status = scraped_post.status
         return True
 
+    def _apply_annotation_result(self, post: Post, result: TitleAnnotationResult) -> None:
+        post.title_annotation = result.annotation
+        post.title_annotation_source = result.source
+        post.title_annotation_status = result.status
+        post.title_annotation_error = result.error
+        post.title_annotation_updated_at = datetime.now(timezone.utc)
+
     def _find_active_refresh_task(self, session: Session) -> Task | None:
         return (
             session.query(Task)
             .filter(
                 Task.kind == TaskKind.REFRESH_POSTS.value,
                 Task.status.in_([TaskStatus.QUEUED.value, TaskStatus.RUNNING_REFRESH.value]),
+            )
+            .order_by(Task.created_at.desc())
+            .first()
+        )
+
+    def _find_active_annotation_task(self, session: Session) -> Task | None:
+        return (
+            session.query(Task)
+            .filter(
+                Task.kind == TaskKind.ANNOTATE_TITLES.value,
+                Task.status.in_([TaskStatus.QUEUED.value, TaskStatus.RUNNING_ANNOTATE.value]),
             )
             .order_by(Task.created_at.desc())
             .first()
@@ -552,12 +731,41 @@ def _resolve_refresh_timeout_seconds() -> int:
     return max(15, timeout)
 
 
+def _resolve_annotation_timeout_seconds() -> int:
+    raw_value = os.getenv("FANBOX_ANNOTATION_TIMEOUT_SECONDS", "30").strip()
+    try:
+        timeout = int(raw_value)
+    except ValueError:
+        return 30
+    return max(5, timeout)
+
+
+def _resolve_annotation_batch_size() -> int:
+    raw_value = os.getenv("FANBOX_ANNOTATION_BATCH_SIZE", "20").strip()
+    try:
+        batch_size = int(raw_value)
+    except ValueError:
+        return 20
+    return max(1, batch_size)
+
+
+def _resolve_annotation_concurrency() -> int:
+    raw_value = os.getenv("FANBOX_ANNOTATION_CONCURRENCY", "5").strip()
+    try:
+        concurrency = int(raw_value)
+    except ValueError:
+        return 5
+    return max(1, concurrency)
+
+
 def _interrupted_task_outcome(kind: str) -> tuple[str, str]:
     message = "Task was interrupted because the app stopped before it finished."
     if kind == TaskKind.OPEN_LOGIN.value:
         return TaskStatus.FAILED_AUTH.value, message
     if kind == TaskKind.DOWNLOAD_POST.value:
         return TaskStatus.FAILED_DOWNLOAD.value, message
+    if kind == TaskKind.ANNOTATE_TITLES.value:
+        return TaskStatus.FAILED_ANNOTATE.value, message
     return TaskStatus.FAILED_PARSE.value, message
 
 

@@ -8,6 +8,10 @@ import type {
   Settings,
   Task,
   TaskClearResult,
+  TitleAnnotationCacheClearResult,
+  TitleAliasUpsertRequest,
+  TitleAliasUpsertResult,
+  TitleAliasesClearResult,
   TaskResponse,
 } from './types'
 
@@ -83,6 +87,15 @@ export const api = {
       method: 'POST',
       body: JSON.stringify({ year }),
     }),
+  openTitleAliasesPath: () => request<OpenPathResult>('/api/title-aliases/open', { method: 'POST' }),
+  clearTitleAliases: () => request<TitleAliasesClearResult>('/api/title-aliases/clear', { method: 'POST' }),
+  upsertTitleAliases: (payload: TitleAliasUpsertRequest) =>
+    request<TitleAliasUpsertResult>('/api/title-aliases/upsert', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    }),
+  clearTitleAnnotationCache: () =>
+    request<TitleAnnotationCacheClearResult>('/api/title-annotations/clear-cache', { method: 'POST' }),
   purgeArchives: (year?: string | null) =>
     request<ArchiveActionResult>('/api/archives/purge', {
       method: 'POST',

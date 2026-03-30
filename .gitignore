@@ -20,3 +20,4 @@ frontend/dist/
 *.db
 *.sqlite3
 *.log
+title_annotation_design.md

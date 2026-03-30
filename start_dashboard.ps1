@@ -1,3 +1,7 @@
+param(
+    [switch]$Restart
+)
+
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 
@@ -7,6 +11,7 @@ $frontendDir = Join-Path $root 'frontend'
 $frontendDist = Join-Path $frontendDir 'dist\index.html'
 $appUrl = 'http://127.0.0.1:8000/'
 $healthUrl = 'http://127.0.0.1:8000/health'
+$preferredPython = 'C:\Users\Kotorin\AppData\Local\Programs\Python\Python312\python.exe'
 
 function Ensure-FrontendBuild {
     if (Test-Path $frontendDist) {
@@ -37,49 +42,103 @@ function Ensure-FrontendBuild {
     }
 }
 
-Ensure-FrontendBuild
+function Test-BackendHealth {
+    try {
+        $response = Invoke-WebRequest -Uri $healthUrl -UseBasicParsing -TimeoutSec 2
+        return $response.StatusCode -eq 200
+    }
+    catch {
+        return $false
+    }
+}
 
-$existing = Get-NetTCPConnection -LocalPort 8000 -ErrorAction SilentlyContinue | Select-Object -First 1
-if (-not $existing) {
+function Wait-BackendHealth {
+    param(
+        [bool]$DesiredState,
+        [int]$Attempts = 40,
+        [int]$DelayMs = 500
+    )
+
+    foreach ($attempt in 1..$Attempts) {
+        $healthy = Test-BackendHealth
+        if ($healthy -eq $DesiredState) {
+            return $true
+        }
+        Start-Sleep -Milliseconds $DelayMs
+    }
+
+    return $false
+}
+
+function Get-BackendPortPids {
+    return @(
+        Get-NetTCPConnection -LocalPort 8000 -ErrorAction SilentlyContinue |
+            Select-Object -ExpandProperty OwningProcess -Unique
+    ) | Where-Object { $_ }
+}
+
+function Resolve-PythonLauncher {
+    if (Test-Path $preferredPython) {
+        return @{
+            FilePath = $preferredPython
+            Arguments = @('-m', 'uvicorn', 'app.main:app', '--host', '127.0.0.1', '--port', '8000')
+        }
+    }
+
     $python = Get-Command python -ErrorAction SilentlyContinue
-    $launcher = $null
-    $arguments = @()
-
     if ($python) {
-        $launcher = $python.Source
-        $arguments = @('-m', 'uvicorn', 'app.main:app', '--host', '127.0.0.1', '--port', '8000')
-    }
-    else {
-        $py = Get-Command py -ErrorAction SilentlyContinue
-        if ($py) {
-            $launcher = $py.Source
-            $arguments = @('-3', '-m', 'uvicorn', 'app.main:app', '--host', '127.0.0.1', '--port', '8000')
+        return @{
+            FilePath = $python.Source
+            Arguments = @('-m', 'uvicorn', 'app.main:app', '--host', '127.0.0.1', '--port', '8000')
         }
     }
 
-    if (-not $launcher) {
-        throw 'Python not found in PATH.'
-    }
-
-    Start-Process -FilePath $launcher -WorkingDirectory $backendDir -ArgumentList $arguments -WindowStyle Hidden
-
-    $ok = $false
-    foreach ($attempt in 1..40) {
-        try {
-            $response = Invoke-WebRequest -Uri $healthUrl -UseBasicParsing -TimeoutSec 2
-            if ($response.StatusCode -eq 200) {
-                $ok = $true
-                break
-            }
-        }
-        catch {
-            Start-Sleep -Milliseconds 500
+    $py = Get-Command py -ErrorAction SilentlyContinue
+    if ($py) {
+        return @{
+            FilePath = $py.Source
+            Arguments = @('-3', '-m', 'uvicorn', 'app.main:app', '--host', '127.0.0.1', '--port', '8000')
         }
     }
 
-    if (-not $ok) {
+    throw 'Python not found in PATH.'
+}
+
+function Start-Backend {
+    $launcher = Resolve-PythonLauncher
+    Start-Process -FilePath $launcher.FilePath -WorkingDirectory $backendDir -ArgumentList $launcher.Arguments -WindowStyle Hidden
+
+    if (-not (Wait-BackendHealth -DesiredState $true -Attempts 40 -DelayMs 500)) {
         throw 'Backend failed to start within the expected time.'
     }
+}
+
+function Stop-Backend {
+    $pids = Get-BackendPortPids
+    if (-not $pids -or $pids.Count -eq 0) {
+        return
+    }
+
+    foreach ($processId in $pids) {
+        try {
+            Stop-Process -Id $processId -Force -ErrorAction Stop
+        }
+        catch {
+        }
+    }
+
+    Start-Sleep -Milliseconds 500
+    [void](Wait-BackendHealth -DesiredState $false -Attempts 20 -DelayMs 250)
+}
+
+Ensure-FrontendBuild
+
+if ($Restart) {
+    Stop-Backend
+    Start-Backend
+}
+elseif (-not (Test-BackendHealth)) {
+    Start-Backend
 }
 
 Start-Process $appUrl
