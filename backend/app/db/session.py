@@ -6,6 +6,7 @@ from sqlalchemy import create_engine, inspect, text
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.core.config import get_config
+from app.core.default_settings import build_default_settings, is_empty_setting_value
 from app.db.models import Base, Settings, TitleAnnotationStatus
 
 
@@ -25,23 +26,7 @@ def init_db() -> None:
     with SessionLocal() as session:
         settings = session.get(Settings, 1)
         if settings is None:
-            default_root = config.project_root / "backend" / "data"
-            session.add(
-                Settings(
-                    id=1,
-                    profile_dir=str(default_root / "profile"),
-                    download_dir=str(default_root / "downloads"),
-                    library_dir=r"D:\hmoe\Siu",
-                    temp_dir=str(default_root / "temp"),
-                    download_concurrency=5,
-                    posts_per_row=4,
-                    auto_delete_archive=True,
-                    llm_enabled=False,
-                    llm_base_url="https://api.deepseek.com",
-                    llm_model="deepseek-chat",
-                    title_aliases_path=str(config.project_root / "backend" / "app" / "core" / "title_aliases.json"),
-                )
-            )
+            session.add(Settings(id=1, **build_default_settings(config)))
             session.commit()
 
 
@@ -54,6 +39,7 @@ def get_db() -> Generator[Session, None, None]:
 
 
 def _apply_runtime_migrations() -> None:
+    defaults = build_default_settings(config)
     inspector = inspect(engine)
     if "settings" not in inspector.get_table_names():
         return
@@ -62,33 +48,49 @@ def _apply_runtime_migrations() -> None:
     with engine.begin() as connection:
         if "auto_delete_archive" not in columns:
             connection.execute(
-                text("ALTER TABLE settings ADD COLUMN auto_delete_archive BOOLEAN NOT NULL DEFAULT 1")
+                text(
+                    f"ALTER TABLE settings ADD COLUMN auto_delete_archive BOOLEAN NOT NULL DEFAULT {1 if defaults['auto_delete_archive'] else 0}"
+                )
             )
         if "download_concurrency" not in columns:
-            connection.execute(text("ALTER TABLE settings ADD COLUMN download_concurrency INTEGER NOT NULL DEFAULT 5"))
+            connection.execute(
+                text(
+                    f"ALTER TABLE settings ADD COLUMN download_concurrency INTEGER NOT NULL DEFAULT {int(defaults['download_concurrency'])}"
+                )
+            )
         if "posts_per_row" not in columns:
-            connection.execute(text("ALTER TABLE settings ADD COLUMN posts_per_row INTEGER NOT NULL DEFAULT 4"))
+            connection.execute(
+                text(f"ALTER TABLE settings ADD COLUMN posts_per_row INTEGER NOT NULL DEFAULT {int(defaults['posts_per_row'])}")
+            )
         if "llm_enabled" not in columns:
-            connection.execute(text("ALTER TABLE settings ADD COLUMN llm_enabled BOOLEAN NOT NULL DEFAULT 0"))
+            connection.execute(
+                text(f"ALTER TABLE settings ADD COLUMN llm_enabled BOOLEAN NOT NULL DEFAULT {1 if defaults['llm_enabled'] else 0}")
+            )
         if "llm_api_key" not in columns:
             connection.execute(text("ALTER TABLE settings ADD COLUMN llm_api_key VARCHAR(500)"))
         if "llm_base_url" not in columns:
             connection.execute(
                 text(
                     "ALTER TABLE settings ADD COLUMN llm_base_url VARCHAR(500) "
-                    "NOT NULL DEFAULT 'https://api.deepseek.com'"
+                    f"NOT NULL DEFAULT '{defaults['llm_base_url']}'"
                 )
             )
         if "llm_model" not in columns:
             connection.execute(
-                text("ALTER TABLE settings ADD COLUMN llm_model VARCHAR(100) NOT NULL DEFAULT 'deepseek-chat'")
+                text(f"ALTER TABLE settings ADD COLUMN llm_model VARCHAR(100) NOT NULL DEFAULT '{defaults['llm_model']}'")
             )
         if "title_aliases_path" not in columns:
             connection.execute(text("ALTER TABLE settings ADD COLUMN title_aliases_path VARCHAR(500) NOT NULL DEFAULT ''"))
     with SessionLocal() as session:
         settings = session.get(Settings, 1)
-        if settings is not None and not settings.title_aliases_path:
-            settings.title_aliases_path = str(config.project_root / "backend" / "app" / "core" / "title_aliases.json")
+        updated = False
+        if settings is not None:
+            for field, value in defaults.items():
+                current = getattr(settings, field, None)
+                if is_empty_setting_value(current):
+                    setattr(settings, field, None if field == "llm_api_key" and value == "" else value)
+                    updated = True
+        if updated:
             session.commit()
     post_columns = {column["name"] for column in inspector.get_columns("posts")} if "posts" in inspector.get_table_names() else set()
     with engine.begin() as connection:

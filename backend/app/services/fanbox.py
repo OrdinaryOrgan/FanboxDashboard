@@ -12,6 +12,8 @@ from app.db.models import PostStatus, RefreshMode, Settings
 
 PAGE_FETCH_CONCURRENCY = 4
 PAGE_FETCH_LIMIT = 100
+LOGIN_WINDOW_TIMEOUT_SECONDS = 180
+LOGIN_WINDOW_POLL_INTERVAL_MS = 1500
 
 
 class FanboxAuthError(RuntimeError):
@@ -78,11 +80,12 @@ async def open_login_window(settings: Settings) -> str:
         try:
             page = context.pages[0] if context.pages else await context.new_page()
             await page.goto(settings.creator_url, wait_until="domcontentloaded")
-            await asyncio.sleep(180)
+            await _wait_for_login_completion(page, timeout_seconds=LOGIN_WINDOW_TIMEOUT_SECONDS)
+            await page.wait_for_timeout(800)
             await context.storage_state(path=str(_storage_state_path(settings)))
         finally:
             await context.close()
-    return "Login window opened. Please finish login within 3 minutes."
+    return "Login completed and exported persistent state."
 
 
 async def refresh_posts(
@@ -732,6 +735,23 @@ async def _ensure_authenticated(page) -> None:
     for left, right in login_markers:
         if left in body_text and right in body_text:
             raise FanboxAuthError("Current auth state is not logged in. Please refresh the dedicated login window.")
+
+
+async def _wait_for_login_completion(page, timeout_seconds: int) -> None:
+    deadline = asyncio.get_running_loop().time() + max(1, timeout_seconds)
+    last_error: str | None = None
+
+    while asyncio.get_running_loop().time() < deadline:
+        try:
+            await _dismiss_age_confirmation(page)
+            await _ensure_authenticated(page)
+            return
+        except FanboxAuthError as exc:
+            last_error = str(exc)
+            await page.wait_for_timeout(LOGIN_WINDOW_POLL_INTERVAL_MS)
+
+    detail = f" {last_error}" if last_error else ""
+    raise FanboxAuthError(f"Login was not completed within {timeout_seconds} seconds.{detail}")
 
 
 async def _dismiss_age_confirmation(page) -> None:

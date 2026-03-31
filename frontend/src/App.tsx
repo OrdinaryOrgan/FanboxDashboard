@@ -115,6 +115,9 @@ type AppProps = {
 
 const FLOATING_PANEL_EXIT_DELAY_MS = 190
 const COVER_READY_TIMEOUT_MS = 900
+const AUTH_FAST_POLL_INTERVAL_MS = 3_000
+const AUTH_DEFAULT_POLL_INTERVAL_MS = 45_000
+const AUTH_FAST_POLL_WINDOW_MS = 180_000
 const HAS_TIMEZONE_SUFFIX = /([zZ]|[+-]\d{2}:\d{2})$/
 const MIN_TASK_DRAWER_WIDTH = 560
 const MAX_TASK_DRAWER_WIDTH = 1080
@@ -439,6 +442,7 @@ export default function App({
   const [privacyMode, setPrivacyMode] = useState(
     () => typeof window !== 'undefined' && window.localStorage.getItem('fanbox-dashboard-privacy-mode') === 'on',
   )
+  const [authFastPollingUntil, setAuthFastPollingUntil] = useState<number | null>(null)
   const autoRefreshTriggeredRef = useRef(false)
   const decodedCoverUrlsRef = useRef<Set<string>>(new Set())
   const coverReadyPromisesRef = useRef<Map<string, Promise<void>>>(new Map())
@@ -516,7 +520,16 @@ export default function App({
   const authQuery = useQuery({
     queryKey: ['auth-status'],
     queryFn: api.getAuthStatus,
-    refetchInterval: 45_000,
+    refetchInterval: (query) => {
+      const hasActiveLoginTask = (tasksQuery.data as Task[] | undefined)?.some(
+        (task) => task.kind === 'open_login' && ['queued', 'running_login'].includes(task.status),
+      )
+      const fastWindowActive =
+        authFastPollingUntil !== null &&
+        authFastPollingUntil > Date.now() &&
+        !(query.state.data as { authenticated?: boolean } | undefined)?.authenticated
+      return hasActiveLoginTask || fastWindowActive ? AUTH_FAST_POLL_INTERVAL_MS : AUTH_DEFAULT_POLL_INTERVAL_MS
+    },
   })
 
   const invalidateOperationalQueries = async () => {
@@ -539,7 +552,11 @@ export default function App({
     mutationFn: api.openLogin,
     onSuccess: async () => {
       message.success('已打开登录窗口')
-      await queryClient.invalidateQueries({ queryKey: ['auth-status'] })
+      setAuthFastPollingUntil(Date.now() + AUTH_FAST_POLL_WINDOW_MS)
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ['auth-status'] }),
+        queryClient.invalidateQueries({ queryKey: ['tasks'] }),
+      ])
     },
   })
 
@@ -778,6 +795,12 @@ export default function App({
       })
     }
   }, [followSystemTheme, form, settingsQuery.data])
+
+  useEffect(() => {
+    if (authQuery.data?.authenticated && authFastPollingUntil !== null) {
+      setAuthFastPollingUntil(null)
+    }
+  }, [authFastPollingUntil, authQuery.data?.authenticated])
 
   useEffect(() => {
     return () => {

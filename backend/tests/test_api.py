@@ -6,6 +6,8 @@ import app.main as main_module
 
 TEST_DB = Path(__file__).resolve().parents[1] / "data" / "test.db"
 
+from app.core.config import get_config
+from app.core.default_settings import build_default_settings
 from app.db.models import Artifact, Post, PostStatus, RefreshMode, Settings, Task, TaskKind, TaskStatus
 from app.db.session import engine, init_db
 from app.db.session import SessionLocal
@@ -81,18 +83,26 @@ def test_settings_roundtrip() -> None:
 
 def test_settings_defaults_enable_auto_delete_and_concurrency() -> None:
     client = TestClient(app)
+    defaults = build_default_settings(get_config())
 
     response = client.get("/api/settings")
 
     assert response.status_code == 200
-    assert response.json()["data"]["download_concurrency"] == 5
-    assert response.json()["data"]["posts_per_row"] == 4
-    assert response.json()["data"]["auto_delete_archive"] is True
-    assert response.json()["data"]["llm_enabled"] is False
+    assert response.json()["data"]["creator_url"] == defaults["creator_url"]
+    assert response.json()["data"]["profile_dir"] == defaults["profile_dir"]
+    assert response.json()["data"]["download_dir"] == defaults["download_dir"]
+    assert response.json()["data"]["library_dir"] == defaults["library_dir"]
+    assert response.json()["data"]["temp_dir"] == defaults["temp_dir"]
+    assert response.json()["data"]["mega_command"] == defaults["mega_command"]
+    assert response.json()["data"]["playwright_channel"] == defaults["playwright_channel"]
+    assert response.json()["data"]["download_concurrency"] == defaults["download_concurrency"]
+    assert response.json()["data"]["posts_per_row"] == defaults["posts_per_row"]
+    assert response.json()["data"]["auto_delete_archive"] is defaults["auto_delete_archive"]
+    assert response.json()["data"]["llm_enabled"] is defaults["llm_enabled"]
     assert response.json()["data"]["llm_api_key"] == ""
-    assert response.json()["data"]["llm_base_url"] == "https://api.deepseek.com"
-    assert response.json()["data"]["llm_model"] == "deepseek-chat"
-    assert Path(response.json()["data"]["title_aliases_path"]).name == "title_aliases.json"
+    assert response.json()["data"]["llm_base_url"] == defaults["llm_base_url"]
+    assert response.json()["data"]["llm_model"] == defaults["llm_model"]
+    assert response.json()["data"]["title_aliases_path"] == defaults["title_aliases_path"]
 
 
 def test_open_title_aliases_path_opens_parent_folder(monkeypatch, tmp_path: Path) -> None:

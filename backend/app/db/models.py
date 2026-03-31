@@ -6,6 +6,8 @@ from enum import StrEnum
 from sqlalchemy import Boolean, DateTime, ForeignKey, String, Text, UniqueConstraint, func
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
+from app.core.default_settings import default_setting_value
+
 
 class Base(DeclarativeBase):
     pass
@@ -76,22 +78,26 @@ class Settings(Base):
     __tablename__ = "settings"
 
     id: Mapped[int] = mapped_column(primary_key=True, default=1)
-    creator_url: Mapped[str] = mapped_column(String(500), default="https://www.fanbox.cc/")
-    profile_dir: Mapped[str] = mapped_column(String(500), default="")
-    download_dir: Mapped[str] = mapped_column(String(500), default="")
-    library_dir: Mapped[str] = mapped_column(String(500), default="")
-    temp_dir: Mapped[str] = mapped_column(String(500), default="")
-    mega_command: Mapped[str] = mapped_column(String(100), default="mega-get")
-    playwright_channel: Mapped[str] = mapped_column(String(50), default="msedge")
-    refresh_interval_minutes: Mapped[int] = mapped_column(default=0)
-    download_concurrency: Mapped[int] = mapped_column(default=5)
-    posts_per_row: Mapped[int] = mapped_column(default=4)
-    auto_delete_archive: Mapped[bool] = mapped_column(Boolean, default=True)
-    llm_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
+    creator_url: Mapped[str] = mapped_column(String(500), default=lambda: str(default_setting_value("creator_url")))
+    profile_dir: Mapped[str] = mapped_column(String(500), default=lambda: str(default_setting_value("profile_dir")))
+    download_dir: Mapped[str] = mapped_column(String(500), default=lambda: str(default_setting_value("download_dir")))
+    library_dir: Mapped[str] = mapped_column(String(500), default=lambda: str(default_setting_value("library_dir")))
+    temp_dir: Mapped[str] = mapped_column(String(500), default=lambda: str(default_setting_value("temp_dir")))
+    mega_command: Mapped[str] = mapped_column(String(100), default=lambda: str(default_setting_value("mega_command")))
+    playwright_channel: Mapped[str] = mapped_column(
+        String(50), default=lambda: str(default_setting_value("playwright_channel"))
+    )
+    refresh_interval_minutes: Mapped[int] = mapped_column(default=lambda: int(default_setting_value("refresh_interval_minutes")))
+    download_concurrency: Mapped[int] = mapped_column(default=lambda: int(default_setting_value("download_concurrency")))
+    posts_per_row: Mapped[int] = mapped_column(default=lambda: int(default_setting_value("posts_per_row")))
+    auto_delete_archive: Mapped[bool] = mapped_column(Boolean, default=lambda: bool(default_setting_value("auto_delete_archive")))
+    llm_enabled: Mapped[bool] = mapped_column(Boolean, default=lambda: bool(default_setting_value("llm_enabled")))
     llm_api_key: Mapped[str | None] = mapped_column(String(500), nullable=True)
-    llm_base_url: Mapped[str] = mapped_column(String(500), default="https://api.deepseek.com")
-    llm_model: Mapped[str] = mapped_column(String(100), default="deepseek-chat")
-    title_aliases_path: Mapped[str] = mapped_column(String(500), default="")
+    llm_base_url: Mapped[str] = mapped_column(String(500), default=lambda: str(default_setting_value("llm_base_url")))
+    llm_model: Mapped[str] = mapped_column(String(100), default=lambda: str(default_setting_value("llm_model")))
+    title_aliases_path: Mapped[str] = mapped_column(
+        String(500), default=lambda: str(default_setting_value("title_aliases_path"))
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
