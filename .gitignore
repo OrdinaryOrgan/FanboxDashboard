@@ -1,23 +1,31 @@
+# Local personal tooling and reference files
 .venv/
 .codex/
 .skill-install-tmp/
 .impeccable.md
+title_annotation_design.md
+findings.md
+progress.md
+task_plan.md
+
+# Python caches and test artifacts
 __pycache__/
 *.pyc
 *.pyo
 *.pyd
 .pytest_cache/
+backend/.pytest_cache/
 .mypy_cache/
 .coverage
 coverage.xml
 
+# Local runtime state
 backend/data/
-backend/.pytest_cache/
+backend/tests/data/
 
+# Frontend install/build outputs
 frontend/node_modules/
 frontend/dist/
 
-*.db
-*.sqlite3
+# Local logs
 *.log
-title_annotation_design.md

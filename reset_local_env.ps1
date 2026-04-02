@@ -3,6 +3,7 @@ $ProgressPreference = 'SilentlyContinue'
 
 $root = Split-Path -Parent $MyInvocation.MyCommand.Path
 $healthUrl = 'http://127.0.0.1:8000/health'
+$backendPort = 8000
 
 function Test-BackendHealth {
     try {
@@ -14,28 +15,94 @@ function Test-BackendHealth {
     }
 }
 
-function Get-BackendPortPids {
+function Get-ListeningPidsOnPort {
+    param(
+        [Parameter(Mandatory = $true)]
+        [int]$Port
+    )
+
     return @(
-        Get-NetTCPConnection -LocalPort 8000 -ErrorAction SilentlyContinue |
+        Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue |
             Select-Object -ExpandProperty OwningProcess -Unique
     ) | Where-Object { $_ }
 }
 
+function Get-ProcessCommandLine {
+    param(
+        [Parameter(Mandatory = $true)]
+        [int]$ProcessId
+    )
+
+    try {
+        $process = Get-CimInstance Win32_Process -Filter "ProcessId = $ProcessId" -ErrorAction Stop
+        return $process.CommandLine
+    }
+    catch {
+        return $null
+    }
+}
+
+function Test-IsProjectBackendProcess {
+    param(
+        [Parameter(Mandatory = $true)]
+        [int]$ProcessId
+    )
+
+    $commandLine = Get-ProcessCommandLine -ProcessId $ProcessId
+    if (-not $commandLine) {
+        return $false
+    }
+
+    $normalized = $commandLine.ToLowerInvariant()
+    return $normalized.Contains('app.main:app') -and $normalized.Contains("--port $backendPort")
+}
+
+function Get-ProjectBackendPids {
+    return @(Get-ListeningPidsOnPort -Port $backendPort | Where-Object { Test-IsProjectBackendProcess -ProcessId $_ })
+}
+
+function Wait-BackendStopped {
+    param(
+        [int]$Attempts = 20,
+        [int]$DelayMs = 300
+    )
+
+    foreach ($attempt in 1..$Attempts) {
+        if ((Get-ProjectBackendPids).Count -eq 0 -and -not (Test-BackendHealth)) {
+            return $true
+        }
+
+        Start-Sleep -Milliseconds $DelayMs
+    }
+
+    return $false
+}
+
 function Stop-BackendIfRunning {
-    if (-not (Test-BackendHealth)) {
+    $listeningPids = @(Get-ListeningPidsOnPort -Port $backendPort)
+    if (-not $listeningPids -or $listeningPids.Count -eq 0) {
         return
     }
 
-    $pids = Get-BackendPortPids
-    foreach ($processId in $pids) {
+    $projectPids = @(Get-ProjectBackendPids)
+    if (-not $projectPids -or $projectPids.Count -eq 0) {
+        if (Test-BackendHealth) {
+            Write-Warning "Port $backendPort is serving /health, but the owning process does not match the expected project backend command line. Skipping stop."
+        }
+        return
+    }
+
+    foreach ($processId in $projectPids) {
         try {
             Stop-Process -Id $processId -Force -ErrorAction Stop
+            Write-Host "Stopped backend process $processId"
         }
         catch {
+            Write-Warning "Failed to stop backend process ${processId}: $($_.Exception.Message)"
         }
     }
 
-    Start-Sleep -Milliseconds 800
+    [void](Wait-BackendStopped)
 }
 
 function Remove-TargetPath {
@@ -95,15 +162,12 @@ Stop-BackendIfRunning
 
 $pathsToRemove = @(
     (Join-Path $root 'backend\data'),
+    (Join-Path $root 'backend\tests\data'),
     (Join-Path $root 'backend\.pytest_cache'),
     (Join-Path $root 'frontend\dist'),
-    (Join-Path $root 'frontend\node_modules'),
     (Join-Path $root '.pytest_cache'),
     (Join-Path $root '.mypy_cache'),
     (Join-Path $root '.skill-install-tmp'),
-    (Join-Path $root 'findings.md'),
-    (Join-Path $root 'progress.md'),
-    (Join-Path $root 'task_plan.md'),
     (Join-Path $root 'coverage.xml'),
     (Join-Path $root '.coverage')
 )
@@ -117,9 +181,7 @@ Remove-TargetsByPattern -BasePath $root -Filter '*.pyc'
 Remove-TargetsByPattern -BasePath $root -Filter '*.pyo'
 Remove-TargetsByPattern -BasePath $root -Filter '*.pyd'
 Remove-TargetsByPattern -BasePath $root -Filter '*.log'
-Remove-TargetsByPattern -BasePath $root -Filter '*.sqlite3'
-Remove-TargetsByPattern -BasePath $root -Filter '*.db'
 
 Write-Host ''
 Write-Host 'Repository cleanup completed.'
-Write-Host 'You can now review git status and prepare the push.'
+Write-Host 'Local runtime state and caches were removed.'
