@@ -469,6 +469,42 @@ a {
   background: color-mix(in srgb, var(--warning-soft) 86%, var(--surface-strong)) !important;
 }
 
+.focus-main.has-auth-alert {
+  display: grid;
+  grid-template-rows: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.focus-main.has-auth-alert .focus-header,
+.focus-main.has-auth-alert .focus-copy {
+  display: flex;
+  align-items: center;
+}
+
+.focus-main.has-auth-alert .focus-alert {
+  margin-top: 0 !important;
+  height: 100%;
+  display: flex;
+  align-items: center;
+}
+
+.focus-main.has-auth-alert .focus-lower {
+  margin-top: 0;
+  padding-top: 0;
+  align-self: end;
+  display: flex;
+  align-items: flex-end;
+}
+
+.focus-alert-button.ant-btn {
+  height: 40px !important;
+  padding-inline: 16px !important;
+  border-radius: 14px !important;
+  font-size: 0.92rem !important;
+  font-weight: 600 !important;
+  box-shadow: none !important;
+}
+
 .focus-lower {
   display: flex;
   margin-top: auto;
@@ -2081,6 +2117,18 @@ body.is-resizing-task-drawer {
   color: var(--app-text) !important;
   border-color: color-mix(in srgb, var(--accent) 18%, var(--surface-stroke)) !important;
   background: color-mix(in srgb, var(--surface-raised) 84%, var(--accent-soft)) !important;
+}
+
+.focus-alert .focus-alert-button.ant-btn {
+  color: var(--status-warning-button-fg) !important;
+  border-color: var(--status-warning-button-border) !important;
+  background: var(--status-warning-button-bg) !important;
+}
+
+.focus-alert .focus-alert-button.ant-btn:not(:disabled):hover {
+  color: var(--status-warning-button-fg) !important;
+  border-color: color-mix(in srgb, var(--warning) 48%, var(--status-warning-button-border)) !important;
+  background: color-mix(in srgb, var(--status-warning-button-bg) 82%, var(--warning-soft)) !important;
 }
 
 .title-alias-mode-group {

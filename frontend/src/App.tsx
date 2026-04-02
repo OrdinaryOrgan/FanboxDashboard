@@ -1469,7 +1469,7 @@ export default function App({
             <div className="focus-panel">
               <Text className="panel-kicker">Today&apos;s Workflow</Text>
               <div className="focus-layout">
-                <div className="focus-main">
+                <div className={`focus-main${authQuery.data && !authQuery.data.authenticated ? ' has-auth-alert' : ''}`}>
                   <div className="focus-header">
                     <div className="focus-copy">
                       <Title level={1} className="focus-title">
@@ -1484,9 +1484,13 @@ export default function App({
                       type="warning"
                       showIcon
                       message="当前登录已失效"
-                      description={authQuery.data.reason ?? '请先打开登录窗口，重新完成 Fanbox 登录。'}
                       action={
-                        <Button size="small" loading={loginMutation.isPending} onClick={() => loginMutation.mutate()}>
+                        <Button
+                          size="small"
+                          className="focus-alert-button llm-neutral-button"
+                          loading={loginMutation.isPending}
+                          onClick={() => loginMutation.mutate()}
+                        >
                           打开登录窗口
                         </Button>
                       }
