@@ -4,6 +4,10 @@ export type Envelope<T> = {
   data: T
 }
 
+export type PostPrimaryAction = 'download' | 'extract' | 'redownload' | 'stale_link' | 'completed'
+
+export type DownloadFailureKind = 'retryable' | 'unavailable' | 'unknown'
+
 export type Post = {
   id: number
   post_id: string
@@ -16,6 +20,10 @@ export type Post = {
   cover_url: string | null
   mega_url: string | null
   status: string
+  operation_status: string
+  primary_action: PostPrimaryAction
+  download_failure_kind: DownloadFailureKind | null
+  download_return_code: number | null
   last_error: string | null
   archive_path: string | null
   extract_dir: string | null
@@ -32,6 +40,8 @@ export type Task = {
   post_id: number | null
   message: string | null
   error: string | null
+  download_failure_kind: DownloadFailureKind | null
+  download_return_code: number | null
   log: string | null
   progress_current: number | null
   progress_total: number | null

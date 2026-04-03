@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import ctypes
 import re
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
@@ -8,15 +9,25 @@ from datetime import datetime
 from pathlib import Path
 from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
 
+from app.core.default_settings import default_setting_value
 from app.db.models import PostStatus, RefreshMode, Settings
 
 PAGE_FETCH_CONCURRENCY = 4
 PAGE_FETCH_LIMIT = 100
 LOGIN_WINDOW_TIMEOUT_SECONDS = 180
 LOGIN_WINDOW_POLL_INTERVAL_MS = 1500
+DEFAULT_CREATOR_URL = str(default_setting_value("creator_url"))
+LOGIN_PAGE_URL = "https://www.fanbox.cc/login"
+AUTH_CHECK_URL = "https://www.fanbox.cc/notifications"
+AUTH_CHECK_TIMEOUT_MS = 20000
+CHROMIUM_WINDOW_CLASSES = {"Chrome_WidgetWin_0", "Chrome_WidgetWin_1"}
 
 
 class FanboxAuthError(RuntimeError):
+    pass
+
+
+class FanboxConfigurationError(RuntimeError):
     pass
 
 
@@ -63,24 +74,46 @@ async def inspect_auth_status(settings: Settings) -> tuple[bool, str | None]:
 
     if not _storage_state_path(settings).exists():
         return False, "No exported storage state found. Please re-open the login window once."
-    return True, "Persistent profile and exported state are present."
+
+    async_playwright = await _get_async_playwright()
+    async with async_playwright() as playwright:
+        context = await playwright.chromium.launch_persistent_context(
+            user_data_dir=str(profile_dir),
+            channel=settings.playwright_channel,
+            headless=True,
+        )
+        try:
+            authenticated, reason = await _probe_fanbox_login_state(context)
+            if authenticated:
+                return True, "Persistent profile, exported state, and Fanbox login are valid."
+            return False, reason or "Stored browser state is present, but Fanbox login could not be verified."
+        finally:
+            await context.close()
 
 
 async def open_login_window(settings: Settings) -> str:
     async_playwright = await _get_async_playwright()
     profile_dir = Path(settings.profile_dir)
     profile_dir.mkdir(parents=True, exist_ok=True)
+    launch_options = {
+        "user_data_dir": str(profile_dir),
+        "channel": settings.playwright_channel,
+        "headless": False,
+    }
+    existing_window_handles = set()
+
+    if _is_windows_desktop():
+        launch_options["args"] = ["--start-maximized"]
+        launch_options["no_viewport"] = True
+        existing_window_handles = _snapshot_chromium_window_handles()
 
     async with async_playwright() as playwright:
-        context = await playwright.chromium.launch_persistent_context(
-            user_data_dir=str(profile_dir),
-            channel=settings.playwright_channel,
-            headless=False,
-        )
+        context = await playwright.chromium.launch_persistent_context(**launch_options)
         try:
             page = context.pages[0] if context.pages else await context.new_page()
-            await page.goto(settings.creator_url, wait_until="domcontentloaded")
-            await _wait_for_login_completion(page, timeout_seconds=LOGIN_WINDOW_TIMEOUT_SECONDS)
+            await _focus_new_chromium_window(page, existing_window_handles)
+            await page.goto(LOGIN_PAGE_URL, wait_until="domcontentloaded")
+            await _wait_for_login_completion(context, page, timeout_seconds=LOGIN_WINDOW_TIMEOUT_SECONDS)
             await page.wait_for_timeout(800)
             await context.storage_state(path=str(_storage_state_path(settings)))
         finally:
@@ -98,6 +131,8 @@ async def refresh_posts(
     profile_dir = Path(settings.profile_dir)
     if not profile_dir.exists() or not any(profile_dir.iterdir()):
         raise FanboxAuthError("No persistent profile found. Please login first.")
+    creator_url = settings.creator_url.strip()
+    _validate_creator_url_for_refresh(creator_url)
 
     async_playwright = await _get_async_playwright()
     async with async_playwright() as playwright:
@@ -107,13 +142,16 @@ async def refresh_posts(
             headless=True,
         )
         try:
+            authenticated, reason = await _probe_fanbox_login_state(context)
+            if not authenticated:
+                raise FanboxAuthError(reason or "Current auth state could not be verified.")
+
             page = context.pages[0] if context.pages else await context.new_page()
-            await page.goto(settings.creator_url, wait_until="domcontentloaded", timeout=20000)
+            await page.goto(creator_url, wait_until="domcontentloaded", timeout=20000)
             await page.wait_for_timeout(1500)
-            await _ensure_authenticated(page)
-            paginate_urls = await _fetch_paginated_api_urls(context, settings.creator_url)
+            paginate_urls = await _fetch_paginated_api_urls(context, creator_url)
             if not paginate_urls:
-                raise FanboxAuthError("No Fanbox API pagination entries were returned.")
+                raise FanboxConfigurationError("当前 Fanbox 页面地址无法读取帖子分页信息，请确认填写的是创作者主页。")
 
             async def fetch_api_page(_, creator_url: str, page_number: int) -> tuple[list[ScrapedPost], int | None]:
                 if page_number < 1 or page_number > len(paginate_urls):
@@ -124,7 +162,7 @@ async def refresh_posts(
             if mode == RefreshMode.INCREMENTAL:
                 posts = await _collect_posts_incremental(
                     context,
-                    settings.creator_url,
+                    creator_url,
                     existing_posts=existing_posts or {},
                     limit=limit,
                     progress_callback=progress_callback,
@@ -133,7 +171,7 @@ async def refresh_posts(
             else:
                 posts = await _collect_posts_full(
                     context,
-                    settings.creator_url,
+                    creator_url,
                     limit=limit,
                     concurrency=PAGE_FETCH_CONCURRENCY,
                     progress_callback=progress_callback,
@@ -141,7 +179,7 @@ async def refresh_posts(
                 )
             if posts:
                 return posts
-            raise FanboxAuthError("No posts were parsed from the list page.")
+            raise FanboxConfigurationError("当前 Fanbox 页面地址没有解析到帖子内容，请检查是否填写了正确的创作者主页。")
         finally:
             await context.storage_state(path=str(_storage_state_path(settings)))
             await context.close()
@@ -160,7 +198,7 @@ async def export_storage_state(settings: Settings) -> str:
         )
         try:
             page = context.pages[0] if context.pages else await context.new_page()
-            await page.goto(settings.creator_url, wait_until="domcontentloaded", timeout=20000)
+            await page.goto(LOGIN_PAGE_URL, wait_until="domcontentloaded", timeout=20000)
             await page.wait_for_timeout(3000)
             await context.storage_state(path=str(_storage_state_path(settings)))
         finally:
@@ -280,7 +318,10 @@ async def _fetch_posts_page(context, creator_url: str, page_number: int) -> tupl
 
 
 async def _fetch_paginated_api_urls(context, creator_url: str) -> list[str]:
-    creator_id = _extract_creator_id(creator_url)
+    try:
+        creator_id = _extract_creator_id(creator_url)
+    except FanboxDependencyError as exc:
+        raise FanboxConfigurationError("当前 Fanbox 页面地址无法识别创作者信息，请确认填写的是创作者主页。") from exc
     payload = await _fetch_api_json(
         context,
         creator_url,
@@ -737,18 +778,47 @@ async def _ensure_authenticated(page) -> None:
             raise FanboxAuthError("Current auth state is not logged in. Please refresh the dedicated login window.")
 
 
-async def _wait_for_login_completion(page, timeout_seconds: int) -> None:
+def _is_login_redirect_url(url: str) -> bool:
+    current_url = url.lower()
+    return "accounts.pixiv.net/login" in current_url or "www.fanbox.cc/login" in current_url
+
+
+def _validate_creator_url_for_refresh(creator_url: str) -> None:
+    if not creator_url or creator_url == DEFAULT_CREATOR_URL:
+        raise FanboxConfigurationError("尚未配置 Fanbox 页面地址，请先在设置中填写你的创作者主页。")
+
+    parts = urlsplit(creator_url)
+    if parts.scheme not in {"http", "https"} or not parts.netloc:
+        raise FanboxConfigurationError("当前 Fanbox 页面地址格式无效，请重新填写完整的创作者主页链接。")
+
+
+async def _probe_fanbox_login_state(context) -> tuple[bool, str | None]:
+    try:
+        response = await context.request.get(
+            AUTH_CHECK_URL,
+            timeout=AUTH_CHECK_TIMEOUT_MS,
+            fail_on_status_code=False,
+        )
+        if _is_login_redirect_url(response.url):
+            return False, "Fanbox redirected to the Pixiv login page."
+        if response.status >= 400:
+            return False, f"Fanbox auth check returned HTTP {response.status}."
+        return True, None
+    except Exception as exc:
+        return False, f"Unable to verify Fanbox login state: {exc}"
+
+
+async def _wait_for_login_completion(context, page, timeout_seconds: int) -> None:
     deadline = asyncio.get_running_loop().time() + max(1, timeout_seconds)
     last_error: str | None = None
 
     while asyncio.get_running_loop().time() < deadline:
-        try:
-            await _dismiss_age_confirmation(page)
-            await _ensure_authenticated(page)
+        await _dismiss_age_confirmation(page)
+        authenticated, reason = await _probe_fanbox_login_state(context)
+        if authenticated:
             return
-        except FanboxAuthError as exc:
-            last_error = str(exc)
-            await page.wait_for_timeout(LOGIN_WINDOW_POLL_INTERVAL_MS)
+        last_error = reason
+        await page.wait_for_timeout(LOGIN_WINDOW_POLL_INTERVAL_MS)
 
     detail = f" {last_error}" if last_error else ""
     raise FanboxAuthError(f"Login was not completed within {timeout_seconds} seconds.{detail}")
@@ -761,6 +831,125 @@ async def _dismiss_age_confirmation(page) -> None:
     yes_button = modal.locator("button").last
     if await yes_button.count():
         await yes_button.click(force=True)
+
+
+def _is_windows_desktop() -> bool:
+    return hasattr(ctypes, "windll")
+
+
+def _snapshot_chromium_window_handles() -> set[int]:
+    return {hwnd for hwnd, _ in _list_visible_chromium_windows()}
+
+
+def _list_visible_chromium_windows() -> list[tuple[int, str]]:
+    if not _is_windows_desktop():
+        return []
+
+    user32 = ctypes.windll.user32
+    windows: list[tuple[int, str]] = []
+    enum_windows_proc = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
+
+    def _callback(hwnd: int, _: int) -> bool:
+        if not user32.IsWindowVisible(hwnd):
+            return True
+
+        class_buffer = ctypes.create_unicode_buffer(256)
+        user32.GetClassNameW(hwnd, class_buffer, 256)
+        if class_buffer.value not in CHROMIUM_WINDOW_CLASSES:
+            return True
+
+        title_length = user32.GetWindowTextLengthW(hwnd)
+        if title_length <= 0:
+            return True
+
+        title_buffer = ctypes.create_unicode_buffer(title_length + 1)
+        user32.GetWindowTextW(hwnd, title_buffer, title_length + 1)
+        windows.append((int(hwnd), title_buffer.value))
+        return True
+
+    callback = enum_windows_proc(_callback)
+    user32.EnumWindows(callback, 0)
+    return windows
+
+
+async def _focus_new_chromium_window(page, existing_window_handles: set[int]) -> None:
+    if not _is_windows_desktop():
+        return
+
+    hwnd = await _find_new_chromium_window(existing_window_handles, "")
+    if hwnd is not None:
+        _maximize_and_bring_window_to_front(hwnd)
+        try:
+            await page.bring_to_front()
+        except Exception:
+            pass
+
+
+async def _find_new_chromium_window(
+    existing_window_handles: set[int],
+    expected_title: str,
+    attempts: int = 20,
+    delay_ms: int = 100,
+) -> int | None:
+    title_match = expected_title.casefold()
+    fallback_hwnd: int | None = None
+
+    for _ in range(max(1, attempts)):
+        new_windows = [
+            (hwnd, title)
+            for hwnd, title in _list_visible_chromium_windows()
+            if hwnd not in existing_window_handles
+        ]
+        if new_windows:
+            if title_match:
+                for hwnd, title in new_windows:
+                    if title_match in title.casefold():
+                        return hwnd
+            if len(new_windows) == 1:
+                return new_windows[0][0]
+            fallback_hwnd = new_windows[0][0]
+        await asyncio.sleep(delay_ms / 1000)
+
+    return fallback_hwnd
+
+
+def _maximize_and_bring_window_to_front(hwnd: int) -> None:
+    if not _is_windows_desktop():
+        return
+
+    user32 = ctypes.windll.user32
+    kernel32 = ctypes.windll.kernel32
+    sw_restore = 9
+    sw_maximize = 3
+    swp_nosize = 0x0001
+    swp_nomove = 0x0002
+    hwnd_topmost = -1
+    hwnd_notopmost = -2
+
+    foreground = user32.GetForegroundWindow()
+    current_thread = kernel32.GetCurrentThreadId()
+    target_thread = user32.GetWindowThreadProcessId(hwnd, None)
+    foreground_thread = user32.GetWindowThreadProcessId(foreground, None) if foreground else 0
+
+    if foreground_thread:
+        user32.AttachThreadInput(foreground_thread, current_thread, True)
+    if target_thread:
+        user32.AttachThreadInput(target_thread, current_thread, True)
+
+    try:
+        if user32.IsIconic(hwnd):
+            user32.ShowWindow(hwnd, sw_restore)
+        if not user32.IsZoomed(hwnd):
+            user32.ShowWindow(hwnd, sw_maximize)
+        user32.BringWindowToTop(hwnd)
+        user32.SetWindowPos(hwnd, hwnd_topmost, 0, 0, 0, 0, swp_nomove | swp_nosize)
+        user32.SetWindowPos(hwnd, hwnd_notopmost, 0, 0, 0, 0, swp_nomove | swp_nosize)
+        user32.SetForegroundWindow(hwnd)
+    finally:
+        if target_thread:
+            user32.AttachThreadInput(target_thread, current_thread, False)
+        if foreground_thread:
+            user32.AttachThreadInput(foreground_thread, current_thread, False)
 
 
 async def _get_async_playwright():

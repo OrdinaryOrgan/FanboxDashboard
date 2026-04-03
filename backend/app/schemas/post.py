@@ -17,6 +17,10 @@ class PostRead(BaseModel):
     cover_url: str | None = None
     mega_url: str | None
     status: str
+    operation_status: str
+    primary_action: str
+    download_failure_kind: str | None = None
+    download_return_code: int | None = None
     last_error: str | None
     archive_path: str | None = None
     extract_dir: str | None = None
@@ -31,6 +35,7 @@ class DownloadRequest(BaseModel):
 
 class RefreshRequest(BaseModel):
     mode: str = Field(default="incremental", pattern="^(incremental|full)$")
+    auto_rescan_after: bool = False
 
 
 class TitleAliasPair(BaseModel):

@@ -36,6 +36,7 @@ import {
   EyeInvisibleOutlined,
   EyeOutlined,
   FolderOpenOutlined,
+  InboxOutlined,
   LeftOutlined,
   LoginOutlined,
   MoonOutlined,
@@ -53,7 +54,15 @@ import dayjs from 'dayjs'
 import utc from 'dayjs/plugin/utc'
 
 import { api } from './api'
-import type { Post, RefreshMode, Settings, Task, TitleAliasUpsertRequest } from './types'
+import type {
+  DownloadFailureKind,
+  Post,
+  PostPrimaryAction,
+  RefreshMode,
+  Settings,
+  Task,
+  TitleAliasUpsertRequest,
+} from './types'
 
 dayjs.extend(utc)
 
@@ -68,28 +77,13 @@ const STATUS_COLORS: Record<string, string> = {
   running_extract: 'processing',
   running_rename: 'processing',
   running_refresh: 'processing',
+  failed_config: 'gold',
   failed_parse: 'red',
   failed_download: 'red',
   failed_extract: 'red',
   failed_rename: 'red',
   failed_auth: 'volcano',
   new: 'default',
-}
-
-const POST_STATUS_META: Record<string, { label: string; tone: string }> = {
-  completed: { label: '已入库', tone: 'success' },
-  missing_local: { label: '待补档', tone: 'warning' },
-  queued: { label: '排队中', tone: 'info' },
-  running_download: { label: '下载中', tone: 'info' },
-  running_extract: { label: '解压中', tone: 'info' },
-  running_rename: { label: '整理中', tone: 'info' },
-  running_refresh: { label: '同步中', tone: 'info' },
-  failed_parse: { label: '解析失败', tone: 'danger' },
-  failed_download: { label: '下载失败', tone: 'danger' },
-  failed_extract: { label: '解压失败', tone: 'danger' },
-  failed_rename: { label: '重命名失败', tone: 'danger' },
-  failed_auth: { label: '登录失效', tone: 'danger' },
-  new: { label: '新发现', tone: 'neutral' },
 }
 
 type Panel = 'settings' | 'archive' | 'llm' | null
@@ -112,16 +106,22 @@ type AppProps = {
   onToggleTheme: () => void
   onFollowSystemThemeChange: (value: boolean) => void
 }
+type PendingDownloadIntent = {
+  postId: string
+  action: PostPrimaryAction
+}
 
 const FLOATING_PANEL_EXIT_DELAY_MS = 190
 const COVER_READY_TIMEOUT_MS = 900
 const AUTH_FAST_POLL_INTERVAL_MS = 3_000
 const AUTH_DEFAULT_POLL_INTERVAL_MS = 45_000
 const AUTH_FAST_POLL_WINDOW_MS = 180_000
+const DEFAULT_CREATOR_URL = 'https://www.fanbox.cc/'
 const HAS_TIMEZONE_SUFFIX = /([zZ]|[+-]\d{2}:\d{2})$/
 const MIN_TASK_DRAWER_WIDTH = 560
 const MAX_TASK_DRAWER_WIDTH = 1080
 const MIN_TASK_TABLE_SCROLL_WIDTH = 780
+const DOWNLOAD_TASK_OVERRIDE_WINDOW_MS = 15_000
 const ACTIVE_TASK_STATUSES = new Set([
   'queued',
   'running_download',
@@ -131,6 +131,20 @@ const ACTIVE_TASK_STATUSES = new Set([
   'running_annotate',
   'running_login',
 ])
+const ACTIVE_POST_OPERATION_STATUSES = new Set(['queued', 'running_download', 'running_extract', 'running_rename'])
+const FAILED_POST_OPERATION_STATUSES = new Set(['failed_config', 'failed_download', 'failed_extract', 'failed_rename'])
+const DOWNLOAD_TASK_CARD_OVERRIDE_STATUSES = new Set([
+  'queued',
+  'running_download',
+  'running_extract',
+  'running_rename',
+  'completed',
+  'failed_config',
+  'failed_download',
+  'failed_extract',
+  'failed_rename',
+])
+const FAILED_INVENTORY_STATUSES = new Set(['failed_parse', 'auth_expired'])
 const toLocalTime = (value: string | null) => {
   if (!value) return null
   return HAS_TIMEZONE_SUFFIX.test(value) ? dayjs(value).local() : dayjs.utc(value).local()
@@ -149,17 +163,17 @@ const clampTaskDrawerWidth = (width: number) => {
   return Math.min(max, Math.max(min, width))
 }
 const hasActiveTask = (task: Task) => ACTIVE_TASK_STATUSES.has(task.status)
-const hasActiveAnnotationTask = (task: Task) =>
-  task.kind === 'annotate_titles' && ['queued', 'running_annotate'].includes(task.status)
 const getTasksRefetchInterval = (isDrawerOpen: boolean, currentTasks: Task[] | undefined) => {
   const hasActiveTasks = currentTasks?.some(hasActiveTask) ?? false
 
   if (hasActiveTasks) return isDrawerOpen ? 3_000 : 8_000
   return isDrawerOpen ? 15_000 : 30_000
 }
+const isMegaCommandConfigurationErrorMessage = (message: string) =>
+  message.includes('下载命令') || message.includes('mega-get') || message.includes('MEGAcmd')
 const getPostsRefetchInterval = (currentTasks: Task[] | undefined) => {
-  const hasAnnotationTasks = currentTasks?.some(hasActiveAnnotationTask) ?? false
-  return hasAnnotationTasks ? 4_000 : 30_000
+  const hasActiveTasks = currentTasks?.some(hasActiveTask) ?? false
+  return hasActiveTasks ? 3_000 : 30_000
 }
 const getOptimalTaskDrawerPageSize = () => {
   if (typeof window === 'undefined') return 10
@@ -200,11 +214,14 @@ function getTaskStatusLabel(task: Task) {
   if (task.status === 'running_extract') return '解压中'
   if (task.status === 'running_rename') return '整理中'
   if (task.status === 'running_login') return '登录中'
-  if (task.status === 'failed_download') return '下载失败'
+  if (task.status === 'failed_download') {
+    return task.download_failure_kind === 'unavailable' ? '资源失效' : '下载失败'
+  }
   if (task.status === 'failed_extract') return '解压失败'
   if (task.status === 'failed_rename') return '整理失败'
   if (task.status === 'failed_annotate') return '补注失败'
   if (task.status === 'failed_auth') return '登录失败'
+  if (task.status === 'failed_config') return '配置错误'
   if (task.status === 'failed_parse') {
     if (task.kind === 'rescan_library') return '扫描失败'
     if (task.kind === 'refresh_posts') return '刷新失败'
@@ -247,10 +264,13 @@ function getTaskProgressLabel(task: Task) {
   if (task.kind === 'download_post') {
     if (task.status === 'queued') return '等待下载压缩包'
     if (task.status === 'running_download') return '正在下载压缩包'
-    if (task.status === 'running_extract') return '下载完成，正在解压'
+    if (task.status === 'running_extract') return '正在解压压缩包'
     if (task.status === 'running_rename') return '解压完成，正在整理'
     if (task.status === 'completed') return '已入库'
-    if (task.status === 'failed_download') return '下载压缩包失败'
+    if (task.status === 'failed_config') return '下载命令未配置，请先打开设置'
+    if (task.status === 'failed_download') {
+      return task.download_failure_kind === 'unavailable' ? 'MEGA 分享文件不存在或已失效' : '下载压缩包失败'
+    }
     if (task.status === 'failed_extract') return '解压失败，请查看日志'
     if (task.status === 'failed_rename') return '整理失败，请查看日志'
   }
@@ -341,8 +361,15 @@ function getRescanButtonLabel(loading: boolean, task: Task | null) {
   return '重扫本地库'
 }
 
-function getPostDownloadButtonState(status: string, isPending: boolean, hasMegaUrl: boolean) {
-  if (status === 'completed') {
+function getPostDownloadButtonState(
+  primaryAction: PostPrimaryAction,
+  operationStatus: string,
+  taskStatusOverride: string | null,
+  taskFailureKind: DownloadFailureKind | null,
+  pendingAction: PostPrimaryAction | null,
+  hasMegaUrl: boolean,
+) {
+  if (taskStatusOverride === 'completed') {
     return {
       label: '已下载',
       icon: <CheckOutlined />,
@@ -353,7 +380,7 @@ function getPostDownloadButtonState(status: string, isPending: boolean, hasMegaU
     }
   }
 
-  if (isPending || status === 'running_download') {
+  if (taskStatusOverride === 'running_download') {
     return {
       label: '下载中',
       icon: <DownloadOutlined />,
@@ -364,7 +391,18 @@ function getPostDownloadButtonState(status: string, isPending: boolean, hasMegaU
     }
   }
 
-  if (status === 'queued') {
+  if (taskStatusOverride === 'running_extract' || taskStatusOverride === 'running_rename') {
+    return {
+      label: taskStatusOverride === 'running_extract' ? '解压中' : '整理中',
+      icon: <SyncOutlined spin />,
+      disabled: true,
+      loading: false,
+      className: 'is-active',
+      type: 'default' as const,
+    }
+  }
+
+  if (taskStatusOverride === 'queued') {
     return {
       label: '排队中',
       icon: <ClockCircleOutlined />,
@@ -375,9 +413,52 @@ function getPostDownloadButtonState(status: string, isPending: boolean, hasMegaU
     }
   }
 
-  if (status === 'running_extract' || status === 'running_rename' || status === 'running_refresh') {
+  if (FAILED_POST_OPERATION_STATUSES.has(taskStatusOverride ?? '')) {
+    if (taskStatusOverride === 'failed_download' && taskFailureKind === 'unavailable') {
+      return {
+        label: '链接失效',
+        icon: <WarningOutlined />,
+        disabled: true,
+        loading: false,
+        className: 'is-retry',
+        type: 'default' as const,
+      }
+    }
     return {
-      label: POST_STATUS_META[status]?.label ?? '处理中',
+      label: '重新下载',
+      icon: <ReloadOutlined />,
+      disabled: !hasMegaUrl,
+      loading: false,
+      className: 'is-retry',
+      type: 'default' as const,
+    }
+  }
+
+  if (operationStatus === 'running_download') {
+    return {
+      label: '下载中',
+      icon: <DownloadOutlined />,
+      disabled: true,
+      loading: true,
+      className: 'is-active',
+      type: 'default' as const,
+    }
+  }
+
+  if (operationStatus === 'queued') {
+    return {
+      label: '排队中',
+      icon: <ClockCircleOutlined />,
+      disabled: true,
+      loading: false,
+      className: 'is-queued',
+      type: 'default' as const,
+    }
+  }
+
+  if (operationStatus === 'running_extract' || operationStatus === 'running_rename') {
+    return {
+      label: operationStatus === 'running_extract' ? '解压中' : '整理中',
       icon: <SyncOutlined spin />,
       disabled: true,
       loading: false,
@@ -386,7 +467,94 @@ function getPostDownloadButtonState(status: string, isPending: boolean, hasMegaU
     }
   }
 
-  if (status.startsWith('failed_')) {
+  if (FAILED_POST_OPERATION_STATUSES.has(operationStatus)) {
+    if (primaryAction === 'stale_link') {
+      return {
+        label: '链接失效',
+        icon: <WarningOutlined />,
+        disabled: true,
+        loading: false,
+        className: 'is-retry',
+        type: 'default' as const,
+      }
+    }
+    return {
+      label: '重新下载',
+      icon: <ReloadOutlined />,
+      disabled: !hasMegaUrl,
+      loading: false,
+      className: 'is-retry',
+      type: 'default' as const,
+    }
+  }
+
+  if (primaryAction === 'completed') {
+    return {
+      label: '已下载',
+      icon: <CheckOutlined />,
+      disabled: true,
+      loading: false,
+      className: 'is-complete',
+      type: 'default' as const,
+    }
+  }
+
+  if (pendingAction) {
+    if (pendingAction === 'extract') {
+      return {
+        label: '解压中',
+        icon: <SyncOutlined spin />,
+        disabled: true,
+        loading: false,
+        className: 'is-active',
+        type: 'default' as const,
+      }
+    }
+
+    if (pendingAction === 'redownload') {
+      return {
+        label: '重新下载中',
+        icon: <SyncOutlined spin />,
+        disabled: true,
+        loading: false,
+        className: 'is-active',
+        type: 'default' as const,
+      }
+    }
+
+    return {
+      label: '下载中',
+      icon: <DownloadOutlined />,
+      disabled: true,
+      loading: true,
+      className: 'is-active',
+      type: 'default' as const,
+    }
+  }
+
+  if (primaryAction === 'extract') {
+    return {
+      label: '解压',
+      icon: <InboxOutlined />,
+      disabled: false,
+      loading: false,
+      className: 'is-extract-ready',
+      type: 'default' as const,
+    }
+  }
+
+  if (primaryAction === 'stale_link') {
+    return {
+      label: '链接失效',
+      icon: <WarningOutlined />,
+      disabled: true,
+      loading: false,
+      className: 'is-retry',
+      type: 'default' as const,
+    }
+  }
+
+  if (primaryAction === 'redownload') {
     return {
       label: '重新下载',
       icon: <ReloadOutlined />,
@@ -407,6 +575,27 @@ function getPostDownloadButtonState(status: string, isPending: boolean, hasMegaU
   }
 }
 
+const hasFailedPostState = (post: Post) =>
+  FAILED_INVENTORY_STATUSES.has(post.status) || FAILED_POST_OPERATION_STATUSES.has(post.operation_status)
+
+function getPostTaskStatusOverride(post: Post, task: Task | null) {
+  if (!task || !DOWNLOAD_TASK_CARD_OVERRIDE_STATUSES.has(task.status)) return null
+
+  if (ACTIVE_TASK_STATUSES.has(task.status)) {
+    return task.status
+  }
+
+  const finishedAt = toLocalTime(task.finished_at)?.valueOf()
+  if (finishedAt == null) return null
+
+  const postUpdatedAt = toLocalTime(post.updated_at)?.valueOf()
+  if (postUpdatedAt != null && postUpdatedAt >= finishedAt) {
+    return null
+  }
+
+  return Date.now() - finishedAt <= DOWNLOAD_TASK_OVERRIDE_WINDOW_MS ? task.status : null
+}
+
 export default function App({
   resolvedThemeMode,
   followSystemTheme,
@@ -418,6 +607,8 @@ export default function App({
   const [form] = Form.useForm<SettingsFormValues>()
   const [titleAliasForm] = Form.useForm<TitleAliasFormValues>()
   const [panel, setPanel] = useState<Panel>(null)
+  const [llmApiKeyHasValue, setLlmApiKeyHasValue] = useState(false)
+  const [llmApiKeyVisible, setLlmApiKeyVisible] = useState(false)
   const [titleAliasModalPost, setTitleAliasModalPost] = useState<Post | null>(null)
   const [tasksOpen, setTasksOpen] = useState(false)
   const [purgeYear, setPurgeYear] = useState<string>()
@@ -433,7 +624,7 @@ export default function App({
     year: string
   } | null>(null)
   const [bulkDownloadBatchIds, setBulkDownloadBatchIds] = useState<string[] | null>(null)
-  const [downloadingPostId, setDownloadingPostId] = useState<string | null>(null)
+  const [pendingDownloadIntent, setPendingDownloadIntent] = useState<PendingDownloadIntent | null>(null)
   const [openingLocalPathPostId, setOpeningLocalPathPostId] = useState<string | null>(null)
   const [retryingTaskId, setRetryingTaskId] = useState<string | null>(null)
   const [taskDrawerWidth, setTaskDrawerWidth] = useState(() => getOptimalTaskDrawerWidth())
@@ -443,7 +634,12 @@ export default function App({
     () => typeof window !== 'undefined' && window.localStorage.getItem('fanbox-dashboard-privacy-mode') === 'on',
   )
   const [authFastPollingUntil, setAuthFastPollingUntil] = useState<number | null>(null)
+  const [creatorUrlPromptOpen, setCreatorUrlPromptOpen] = useState(false)
+  const [downloadCommandPromptOpen, setDownloadCommandPromptOpen] = useState(false)
   const autoRefreshTriggeredRef = useRef(false)
+  const pendingCreatorUrlSetupAfterLoginRef = useRef(false)
+  const creatorUrlPromptDismissedRef = useRef(false)
+  const latestDownloadConfigPromptTaskIdRef = useRef<string | null>(null)
   const decodedCoverUrlsRef = useRef<Set<string>>(new Set())
   const coverReadyPromisesRef = useRef<Map<string, Promise<void>>>(new Map())
   const frontGridRef = useRef<HTMLDivElement | null>(null)
@@ -541,9 +737,10 @@ export default function App({
   }
 
   const refreshMutation = useMutation({
-    mutationFn: api.refreshPosts,
-    onSuccess: async (_, mode) => {
-      message.success(mode === 'full' ? '已创建全量校准任务' : '已创建刷新任务')
+    mutationFn: ({ mode, autoRescanAfter = false }: { mode: RefreshMode; autoRescanAfter?: boolean }) =>
+      api.refreshPosts(mode, autoRescanAfter),
+    onSuccess: async (_, variables) => {
+      message.success(variables.mode === 'full' ? '已创建全量校准任务' : '已创建刷新任务')
       await invalidateOperationalQueries()
     },
   })
@@ -551,6 +748,7 @@ export default function App({
   const loginMutation = useMutation({
     mutationFn: api.openLogin,
     onSuccess: async () => {
+      creatorUrlPromptDismissedRef.current = false
       message.success('已打开登录窗口')
       setAuthFastPollingUntil(Date.now() + AUTH_FAST_POLL_WINDOW_MS)
       await Promise.all([
@@ -569,16 +767,24 @@ export default function App({
   })
 
   const downloadMutation = useMutation({
-    mutationFn: api.downloadPosts,
-    onMutate: (postIds) => {
-      setDownloadingPostId(postIds.length === 1 ? String(postIds[0]) : null)
+    mutationFn: ({ postIds }: { postIds: string[]; action: PostPrimaryAction | null }) => api.downloadPosts(postIds),
+    onMutate: ({ postIds, action }) => {
+      setPendingDownloadIntent(postIds.length === 1 && action ? { postId: String(postIds[0]), action } : null)
     },
     onSuccess: async () => {
       message.success('已创建补档任务')
       await invalidateOperationalQueries()
     },
+    onError: (error) => {
+      const errorMessage = error instanceof Error ? error.message : '创建补档任务失败'
+      if (isMegaCommandConfigurationErrorMessage(errorMessage)) {
+        setDownloadCommandPromptOpen(true)
+        return
+      }
+      message.error(errorMessage)
+    },
     onSettled: () => {
-      setDownloadingPostId(null)
+      setPendingDownloadIntent(null)
     },
   })
 
@@ -592,7 +798,12 @@ export default function App({
       await invalidateOperationalQueries()
     },
     onError: (error) => {
-      message.error(error instanceof Error ? error.message : '重新执行任务失败')
+      const errorMessage = error instanceof Error ? error.message : '重新执行任务失败'
+      if (isMegaCommandConfigurationErrorMessage(errorMessage)) {
+        setDownloadCommandPromptOpen(true)
+        return
+      }
+      message.error(errorMessage)
     },
     onSettled: () => {
       setRetryingTaskId(null)
@@ -703,6 +914,14 @@ export default function App({
   const saveSettingsMutation = useMutation({
     mutationFn: api.saveSettings,
     onSuccess: (data) => {
+      const shouldTriggerPostLoginFullRefresh =
+        pendingCreatorUrlSetupAfterLoginRef.current && data.creator_url.trim() !== DEFAULT_CREATOR_URL
+
+      if (shouldTriggerPostLoginFullRefresh) {
+        pendingCreatorUrlSetupAfterLoginRef.current = false
+        autoRefreshTriggeredRef.current = true
+      }
+
       message.success('设置已保存')
       setPanel(null)
       if (delayedSettingsSyncRef.current !== null) {
@@ -710,13 +929,17 @@ export default function App({
       }
       delayedSettingsSyncRef.current = window.setTimeout(() => {
         queryClient.setQueryData(['settings'], data)
-      form.setFieldsValue({
-        ...data,
-        follow_system_theme: followSystemTheme,
-      })
-      delayedSettingsSyncRef.current = null
-    }, FLOATING_PANEL_EXIT_DELAY_MS)
-  },
+        form.setFieldsValue({
+          ...data,
+          follow_system_theme: followSystemTheme,
+        })
+        delayedSettingsSyncRef.current = null
+
+        if (shouldTriggerPostLoginFullRefresh) {
+          refreshMutation.mutate({ mode: 'full', autoRescanAfter: true })
+        }
+      }, FLOATING_PANEL_EXIT_DELAY_MS)
+    },
   })
 
   const openTitleAliasModal = (post: Post) => {
@@ -770,15 +993,25 @@ export default function App({
   const tasks = tasksQuery.data ?? []
   const latestRefreshTask = tasks.find((task) => task.kind === 'refresh_posts') ?? null
   const latestRescanTask = tasks.find((task) => task.kind === 'rescan_library') ?? null
+  const latestDownloadConfigTask =
+    tasks.find((task) => task.kind === 'download_post' && task.status === 'failed_config') ?? null
   const latestIncrementalRefreshTask =
     tasks.find((task) => task.kind === 'refresh_posts' && task.refresh_mode === 'incremental') ?? null
   const latestFullRefreshTask =
     tasks.find((task) => task.kind === 'refresh_posts' && task.refresh_mode === 'full') ?? null
+  const latestDownloadTaskByPostDbId = useMemo(() => {
+    const taskMap = new Map<number, Task>()
+    for (const task of tasks) {
+      if (task.kind !== 'download_post' || task.post_id == null || taskMap.has(task.post_id)) continue
+      taskMap.set(task.post_id, task)
+    }
+    return taskMap
+  }, [tasks])
   const activeRefreshTask =
     tasks.find((task) => task.kind === 'refresh_posts' && ['queued', 'running_refresh'].includes(task.status)) ?? null
   const activeRescanTask =
     tasks.find((task) => task.kind === 'rescan_library' && ['queued', 'running_refresh'].includes(task.status)) ?? null
-  const requestedRefreshMode = refreshMutation.variables as RefreshMode | undefined
+  const requestedRefreshMode = (refreshMutation.variables as { mode?: RefreshMode } | undefined)?.mode
   const anyRefreshInFlight = Boolean(activeRefreshTask) || refreshMutation.isPending
   const rescanInFlight = Boolean(activeRescanTask) || rescanMutation.isPending
   const incrementalRefreshInFlight =
@@ -786,6 +1019,16 @@ export default function App({
     (refreshMutation.isPending && requestedRefreshMode === 'incremental')
   const fullRefreshInFlight =
     activeRefreshTask?.refresh_mode === 'full' || (refreshMutation.isPending && requestedRefreshMode === 'full')
+  const activeTaskSignature = useMemo(
+    () =>
+      tasks
+        .filter(hasActiveTask)
+        .map((task) => `${task.id}:${task.status}`)
+        .sort()
+        .join('|'),
+    [tasks],
+  )
+  const previousActiveTaskSignatureRef = useRef<string | null>(null)
 
   useEffect(() => {
     if (settingsQuery.data) {
@@ -793,14 +1036,63 @@ export default function App({
         ...settingsQuery.data,
         follow_system_theme: followSystemTheme,
       })
+      setLlmApiKeyHasValue(Boolean(settingsQuery.data.llm_api_key))
     }
   }, [followSystemTheme, form, settingsQuery.data])
+
+  useEffect(() => {
+    if (panel !== 'llm') {
+      setLlmApiKeyVisible(false)
+    }
+  }, [panel])
+
+  useEffect(() => {
+    const previousSignature = previousActiveTaskSignatureRef.current
+    previousActiveTaskSignatureRef.current = activeTaskSignature
+
+    if (previousSignature === null || previousSignature === activeTaskSignature) {
+      return
+    }
+
+    void queryClient.invalidateQueries({ queryKey: ['posts'] })
+  }, [activeTaskSignature, queryClient])
 
   useEffect(() => {
     if (authQuery.data?.authenticated && authFastPollingUntil !== null) {
       setAuthFastPollingUntil(null)
     }
   }, [authFastPollingUntil, authQuery.data?.authenticated])
+
+  useEffect(() => {
+    const authenticated = Boolean(authQuery.data?.authenticated)
+    const creatorUrl = settingsQuery.data?.creator_url?.trim()
+
+    if (!authenticated) {
+      pendingCreatorUrlSetupAfterLoginRef.current = false
+      creatorUrlPromptDismissedRef.current = false
+      return
+    }
+
+    if (!creatorUrl) return
+
+    if (creatorUrl === DEFAULT_CREATOR_URL) {
+      pendingCreatorUrlSetupAfterLoginRef.current = true
+      autoRefreshTriggeredRef.current = true
+      if (!creatorUrlPromptDismissedRef.current) {
+        setCreatorUrlPromptOpen(true)
+      }
+    } else {
+      pendingCreatorUrlSetupAfterLoginRef.current = false
+      creatorUrlPromptDismissedRef.current = false
+    }
+  }, [authQuery.data?.authenticated, settingsQuery.data?.creator_url])
+
+  useEffect(() => {
+    if (!latestDownloadConfigTask) return
+    if (latestDownloadConfigPromptTaskIdRef.current === latestDownloadConfigTask.id) return
+    latestDownloadConfigPromptTaskIdRef.current = latestDownloadConfigTask.id
+    setDownloadCommandPromptOpen(true)
+  }, [latestDownloadConfigTask])
 
   useEffect(() => {
     return () => {
@@ -829,7 +1121,7 @@ export default function App({
   }, [tasksOpen])
 
   useEffect(() => {
-    if (autoRefreshTriggeredRef.current || tasksQuery.isLoading || authQuery.isLoading) return
+    if (autoRefreshTriggeredRef.current || tasksQuery.isLoading || authQuery.isLoading || settingsQuery.isLoading) return
     const hasRefreshInFlight = tasks.some(
       (task) => task.kind === 'refresh_posts' && ['queued', 'running_refresh'].includes(task.status),
     )
@@ -838,9 +1130,20 @@ export default function App({
       return
     }
     if (!authQuery.data?.authenticated) return
+    const creatorUrl = settingsQuery.data?.creator_url?.trim()
+    if (!creatorUrl) return
+    if (creatorUrl === DEFAULT_CREATOR_URL) return
     autoRefreshTriggeredRef.current = true
-    refreshMutation.mutate('incremental')
-  }, [authQuery.data?.authenticated, authQuery.isLoading, refreshMutation, tasks, tasksQuery.isLoading])
+    refreshMutation.mutate({ mode: 'incremental', autoRescanAfter: true })
+  }, [
+    authQuery.data?.authenticated,
+    authQuery.isLoading,
+    refreshMutation,
+    settingsQuery.data?.creator_url,
+    settingsQuery.isLoading,
+    tasks,
+    tasksQuery.isLoading,
+  ])
 
   const availableYears = useMemo(
     () =>
@@ -849,6 +1152,8 @@ export default function App({
       ),
     [posts],
   )
+  const archivePathTemplate = `${settingsQuery.data?.download_dir ?? 'download_dir'}\\<年份>`
+  const archivePathForSelectedYear = purgeYear ? `${settingsQuery.data?.download_dir ?? 'download_dir'}\\${purgeYear}` : null
 
   const currentYear = activePageLayer === 'front' ? frontYear : (backYear ?? frontYear)
 
@@ -958,10 +1263,7 @@ export default function App({
     }),
     [visiblePosts],
   )
-  const failedPostCount = useMemo(
-    () => visiblePosts.filter((post) => post.status.startsWith('failed')).length,
-    [visiblePosts],
-  )
+  const failedPostCount = useMemo(() => visiblePosts.filter((post) => hasFailedPostState(post)).length, [visiblePosts])
 
   const bulkDownloadPostIds = useMemo(
     () =>
@@ -985,7 +1287,7 @@ export default function App({
       posts.filter(
         (post) =>
           bulkDownloadBatchIdSet.has(String(post.post_id)) &&
-          ['queued', 'running_download', 'running_extract', 'running_rename'].includes(post.status),
+          ACTIVE_POST_OPERATION_STATUSES.has(post.operation_status),
       ).length,
     [bulkDownloadBatchIdSet, posts],
   )
@@ -1075,7 +1377,11 @@ export default function App({
       render: (_, record) => (
         <Button
           className="task-retry-button"
-          disabled={!record.status.startsWith('failed') || (retryMutation.isPending && retryingTaskId !== record.id)}
+          disabled={
+            !record.status.startsWith('failed') ||
+            (record.status === 'failed_download' && record.download_failure_kind === 'unavailable') ||
+            (retryMutation.isPending && retryingTaskId !== record.id)
+          }
           loading={retryMutation.isPending && retryingTaskId === record.id}
           onClick={() => retryMutation.mutate(record.id)}
         >
@@ -1087,7 +1393,7 @@ export default function App({
 
   const menuItems: MenuProps['items'] = [
     { key: 'settings', label: '设置', icon: <SettingOutlined /> },
-    { key: 'archive', label: 'Archive 清理', icon: <FolderOpenOutlined /> },
+    { key: 'archive', label: '压缩包清理', icon: <FolderOpenOutlined /> },
     { key: 'llm', label: '标题补注', icon: <RobotOutlined /> },
     { key: 'tasks', label: '任务队列', icon: <UnorderedListOutlined /> },
     { type: 'divider' },
@@ -1105,7 +1411,7 @@ export default function App({
   const handleBulkDownload = () => {
     if (!bulkDownloadPostIds.length) return
     setBulkDownloadBatchIds(bulkDownloadPostIds.map(String))
-    downloadMutation.mutate(bulkDownloadPostIds)
+    downloadMutation.mutate({ postIds: bulkDownloadPostIds, action: null })
   }
 
   const handleCopyTaskId = async (taskId: string) => {
@@ -1258,9 +1564,30 @@ export default function App({
     saveSettingsMutation.mutate(settingsPayload)
   }
 
+  const handleOpenSettingsFromPrompt = () => {
+    setCreatorUrlPromptOpen(false)
+    creatorUrlPromptDismissedRef.current = true
+    setPanel('settings')
+  }
+
+  const handleCloseCreatorUrlPrompt = () => {
+    creatorUrlPromptDismissedRef.current = true
+    setCreatorUrlPromptOpen(false)
+  }
+
+  const handleOpenSettingsFromDownloadPrompt = () => {
+    setDownloadCommandPromptOpen(false)
+    setPanel('settings')
+  }
+
+  const handleCloseDownloadCommandPrompt = () => {
+    setDownloadCommandPromptOpen(false)
+  }
+
   const themeButtonTitle = followSystemTheme
     ? `当前跟随系统，点击切换为手动${resolvedThemeMode === 'dark' ? '浅色' : '深色'}主题`
     : `切换到${resolvedThemeMode === 'dark' ? '浅色' : '深色'}主题`
+  const configuredMegaCommand = settingsQuery.data?.mega_command?.trim() || 'mega-get'
   const currentYearLabel = currentYear ?? '--'
   const latestRefreshSummary = latestRefreshTask
     ? `${latestRefreshTask.refresh_mode === 'full' ? '全量校准' : '增量刷新'} · ${formatTaskTimestamp(latestRefreshTask.created_at)}`
@@ -1312,9 +1639,24 @@ export default function App({
   ]
 
   const renderPostTile = (record: Post) => {
-    const isDownloadPending =
-      downloadMutation.isPending && downloadingPostId != null && downloadingPostId === String(record.post_id)
-    const downloadButtonState = getPostDownloadButtonState(record.status, isDownloadPending, Boolean(record.mega_url))
+    const pendingAction =
+      downloadMutation.isPending &&
+      pendingDownloadIntent != null &&
+      pendingDownloadIntent.postId === String(record.post_id)
+        ? pendingDownloadIntent.action
+        : null
+    const linkedDownloadTask = latestDownloadTaskByPostDbId.get(record.id) ?? null
+    const taskStatusOverride = getPostTaskStatusOverride(record, linkedDownloadTask)
+    const taskFailureKind =
+      taskStatusOverride && taskStatusOverride.startsWith('failed') ? linkedDownloadTask?.download_failure_kind ?? null : null
+    const downloadButtonState = getPostDownloadButtonState(
+      record.primary_action,
+      record.operation_status,
+      taskStatusOverride,
+      taskFailureKind,
+      pendingAction,
+      Boolean(record.mega_url),
+    )
     const displayTitle = record.display_title || record.title
 
     return (
@@ -1357,7 +1699,7 @@ export default function App({
                   icon={downloadButtonState.icon}
                   disabled={downloadButtonState.disabled}
                   loading={downloadButtonState.loading}
-                  onClick={() => downloadMutation.mutate([record.post_id])}
+                  onClick={() => downloadMutation.mutate({ postIds: [record.post_id], action: record.primary_action })}
                 >
                   {downloadButtonState.label}
                 </Button>
@@ -1506,7 +1848,7 @@ export default function App({
                         icon={<ReloadOutlined />}
                         loading={incrementalRefreshInFlight}
                         disabled={anyRefreshInFlight && !incrementalRefreshInFlight}
-                        onClick={() => refreshMutation.mutate('incremental')}
+                        onClick={() => refreshMutation.mutate({ mode: 'incremental' })}
                         >
                           <span
                             key={`refresh-${refreshButtonLabel}-${refreshProgressText ?? 'idle'}`}
@@ -1543,7 +1885,7 @@ export default function App({
                         icon={<SyncOutlined />}
                         loading={fullRefreshInFlight}
                         disabled={anyRefreshInFlight && !fullRefreshInFlight}
-                        onClick={() => refreshMutation.mutate('full')}
+                        onClick={() => refreshMutation.mutate({ mode: 'full' })}
                         >
                           <span
                             key={`full-${fullRefreshButtonLabel}-${refreshProgressText ?? 'idle'}`}
@@ -1747,6 +2089,88 @@ export default function App({
 
       <Modal
         centered
+        open={creatorUrlPromptOpen}
+        onCancel={handleCloseCreatorUrlPrompt}
+        footer={null}
+        width={560}
+        className="floating-panel-modal creator-url-prompt-modal"
+        transitionName="floating-panel-motion"
+        maskTransitionName="floating-panel-mask-motion"
+        title={
+          <div className="floating-panel-title">
+            <span className="floating-panel-title-text">完善同步设置</span>
+          </div>
+        }
+      >
+        <div className="creator-url-prompt-layout">
+          <div className="creator-url-prompt-hero">
+            <div className="creator-url-prompt-copy">
+              <Text className="settings-section-kicker">继续同步前</Text>
+              <Title level={4} className="creator-url-prompt-heading">
+                先填写 Fanbox 页面地址
+              </Title>
+              <Paragraph className="creator-url-prompt-description">
+                当前仍在使用默认地址 <Text code>{DEFAULT_CREATOR_URL}</Text>。打开设置后，在
+                <Text strong>“Fanbox 页面地址”</Text>
+                中填入你的创作者主页，帖子内容才会开始同步。
+              </Paragraph>
+            </div>
+          </div>
+          <div className="floating-panel-actions creator-url-prompt-actions">
+            <div className="floating-panel-button-group">
+              <Button type="primary" onClick={handleOpenSettingsFromPrompt}>
+                打开设置
+              </Button>
+            </div>
+          </div>
+        </div>
+      </Modal>
+
+      <Modal
+        centered
+        open={downloadCommandPromptOpen}
+        onCancel={handleCloseDownloadCommandPrompt}
+        footer={null}
+        width={560}
+        className="floating-panel-modal download-command-prompt-modal"
+        transitionName="floating-panel-motion"
+        maskTransitionName="floating-panel-mask-motion"
+        title={
+          <div className="floating-panel-title">
+            <span className="floating-panel-title-text">完善下载设置</span>
+          </div>
+        }
+      >
+        <div className="download-command-prompt-layout">
+          <div className="download-command-prompt-hero">
+            <div className="download-command-prompt-copy">
+              <Text className="settings-section-kicker">开始补档前</Text>
+              <Title level={4} className="download-command-prompt-heading">
+                先补全下载命令
+              </Title>
+              <Paragraph className="download-command-prompt-description">
+                当前还没有找到可用的下载命令。先到设置里确认
+                <Text strong>“下载命令”</Text>
+                ，补档任务才能正常开始。
+              </Paragraph>
+              <div className="download-command-prompt-meta">
+                <Text className="download-command-prompt-label">当前填写</Text>
+                <div className="download-command-prompt-value">{configuredMegaCommand}</div>
+              </div>
+            </div>
+          </div>
+          <div className="floating-panel-actions download-command-prompt-actions">
+            <div className="floating-panel-button-group">
+              <Button type="primary" onClick={handleOpenSettingsFromDownloadPrompt}>
+                打开设置
+              </Button>
+            </div>
+          </div>
+        </div>
+      </Modal>
+
+      <Modal
+        centered
         open={panel === 'settings'}
         onCancel={() => setPanel(null)}
         footer={null}
@@ -1860,11 +2284,26 @@ export default function App({
         className="floating-panel-modal"
         transitionName="floating-panel-motion"
         maskTransitionName="floating-panel-mask-motion"
-        title={<span className="archive-panel-title">Archive 清理</span>}
+        title={
+          <div className="floating-panel-title">
+            <span className="floating-panel-title-text">压缩包清理</span>
+          </div>
+        }
       >
         <Space direction="vertical" size={18} style={{ width: '100%' }}>
+          <div className="archive-panel-copy">
+            <Paragraph className="archive-panel-description">
+              按年份清理下载目录中的压缩包，已整理到图库中的图片不会受影响。
+            </Paragraph>
+            <div className="archive-path-meta">
+              <Text className="archive-path-label">压缩包目录规则</Text>
+              <div className="archive-path-block" aria-label="Archive 路径模板">
+                {archivePathTemplate}
+              </div>
+            </div>
+          </div>
           <Paragraph className="archive-panel-description" style={{ marginBottom: 0 }}>
-            压缩包统一保存在 <Text code>{`D:\\hmoe\\Siu\\年份\\Archive`}</Text> 的 Archive 目录。可按年份清理，也可以一次清理全部年份。
+            可按年份清理，也可以一次清理全部年份。
           </Paragraph>
           <div className="floating-panel-actions archive-panel-actions">
             <div className="archive-panel-control-row">
@@ -1877,9 +2316,11 @@ export default function App({
                 options={availableYears.map((year) => ({ label: year, value: year }))}
               />
               <Popconfirm
-                title={purgeYear ? `清理 ${purgeYear} 年压缩包？` : '先选择年份'}
+                title={purgeYear ? `清理 ${purgeYear} 年的压缩包？` : '先选择年份'}
                 description={
-                  purgeYear ? `会删除 ${purgeYear} 年 Archive 目录中的压缩包。此操作不可撤销。` : '请选择要清理的年份。'
+                  purgeYear
+                    ? `会删除 ${archivePathForSelectedYear} 中的压缩包。图库中的图片不会受影响，此操作不可撤销。`
+                    : '请选择要清理的年份。'
                 }
                 disabled={!purgeYear}
                 onConfirm={() => purgeArchiveMutation.mutate(purgeYear)}
@@ -1889,8 +2330,8 @@ export default function App({
                 </Button>
               </Popconfirm>
               <Popconfirm
-                title="清理全部年份的压缩包？"
-                description="会删除所有年份 Archive 目录中的压缩包。此操作不可撤销。"
+                title="清理所有年份的压缩包？"
+                description={`会删除 ${archivePathTemplate} 下所有年份目录中的压缩包。图库中的图片不会受影响，此操作不可撤销。`}
                 onConfirm={() => purgeArchiveMutation.mutate(null)}
               >
                 <Button className="archive-danger-button" danger loading={purgeArchiveMutation.isPending}>
@@ -2060,7 +2501,26 @@ export default function App({
                   label="接口密钥"
                   tooltip="只保存在本机设置中，不会写入代码仓库。"
                 >
-                  <Input.Password placeholder="输入本机调试用接口密钥" autoComplete="off" />
+                  <Input
+                    className={`llm-api-key-input${!llmApiKeyVisible && llmApiKeyHasValue ? ' is-masked' : ''}`}
+                    type="text"
+                    placeholder="输入本机调试用接口密钥"
+                    autoComplete="off"
+                    spellCheck={false}
+                    onChange={(event) => setLlmApiKeyHasValue(Boolean(event.target.value))}
+                    suffix={
+                      <button
+                        type="button"
+                        className="llm-api-key-toggle"
+                        aria-label={llmApiKeyVisible ? '隐藏接口密钥' : '显示接口密钥'}
+                        aria-pressed={llmApiKeyVisible}
+                        onMouseDown={(event) => event.preventDefault()}
+                        onClick={() => setLlmApiKeyVisible((current) => !current)}
+                      >
+                        {llmApiKeyVisible ? <EyeOutlined /> : <EyeInvisibleOutlined />}
+                      </button>
+                    }
+                  />
                 </Form.Item>
                 <Form.Item name="llm_base_url" label="接口地址" rules={[{ required: true }]}>
                   <Input placeholder="https://api.deepseek.com" />

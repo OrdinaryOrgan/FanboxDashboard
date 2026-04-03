@@ -2,10 +2,10 @@ from __future__ import annotations
 
 import json
 import os
-import shutil
 import re
 import time
 import ctypes
+import unicodedata
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -38,11 +38,10 @@ def build_post_storage_paths(
     published_at: datetime | None,
     fallback_name: str,
 ) -> PostStoragePaths:
-    del download_root
     year = str((published_at or datetime.now()).year)
     folder_name = sanitize_path_segment(title) or sanitize_path_segment(fallback_name) or "untitled"
     year_root = Path(library_root) / year
-    archive_root = year_root / "Archive"
+    archive_root = Path(download_root) / year
     return PostStoragePaths(
         folder_name=folder_name,
         year=year,
@@ -52,7 +51,8 @@ def build_post_storage_paths(
 
 
 def sanitize_path_segment(value: str) -> str:
-    result = INVALID_WINDOWS_CHARS.sub("_", value.strip())
+    normalized = unicodedata.normalize("NFC", value).strip()
+    result = INVALID_WINDOWS_CHARS.sub("_", normalized)
     return result.rstrip(" .")
 
 
@@ -87,20 +87,21 @@ def directory_has_content(path: str) -> bool:
     return directory.exists() and any(directory.rglob("*"))
 
 
-def archive_dir_for_year(library_root: str, year: str) -> Path:
-    return Path(library_root) / year / "Archive"
+def archive_dir_for_year(download_root: str, year: str) -> Path:
+    return Path(download_root) / year
 
 
 def reconcile_archive_path(
     current_archive_path: str | None,
     library_root: str,
+    download_root: str,
     title: str,
     published_at: datetime | None,
     fallback_name: str,
 ) -> str | None:
     paths = build_post_storage_paths(
         library_root=library_root,
-        download_root=library_root,
+        download_root=download_root,
         title=title,
         published_at=published_at,
         fallback_name=fallback_name,
@@ -112,19 +113,44 @@ def reconcile_archive_path(
     if current_archive_path:
         current = Path(current_archive_path)
         if current.exists() and current.is_file():
-            expected = archive_root / current.name
-            if current.resolve() == expected.resolve():
-                return str(expected)
-            if expected.exists():
-                current.unlink()
-                return str(expected)
-            shutil.move(str(current), str(expected))
-            return str(expected)
+            try:
+                if current.resolve().parent == archive_root.resolve():
+                    return str(current.resolve())
+            except OSError:
+                pass
 
     candidates = sorted(_matching_archive_candidates(archive_root, paths.folder_name, fallback_segment))
     if candidates:
         return str(candidates[0])
     return None
+
+
+def reconcile_extract_dir(
+    current_extract_dir: str | None,
+    library_root: str,
+    title: str,
+    published_at: datetime | None,
+    fallback_name: str,
+) -> str:
+    paths = build_post_storage_paths(
+        library_root=library_root,
+        download_root="",
+        title=title,
+        published_at=published_at,
+        fallback_name=fallback_name,
+    )
+    resolved_root = Path(library_root) / paths.year
+    resolved_root.mkdir(parents=True, exist_ok=True)
+
+    if current_extract_dir:
+        current = Path(current_extract_dir)
+        if current.exists() and current.is_dir():
+            return str(current.resolve())
+
+    matched = _matching_extract_dir(resolved_root, paths.folder_name, sanitize_path_segment(fallback_name))
+    if matched is not None:
+        return str(matched.resolve())
+    return str(Path(paths.extract_dir))
 
 
 def delete_archive_file(path: str | None) -> bool:
@@ -137,14 +163,16 @@ def delete_archive_file(path: str | None) -> bool:
     return True
 
 
-def purge_archive_files(library_root: str, year: str | None = None) -> list[str]:
+def purge_archive_files(download_root: str, year: str | None = None) -> list[str]:
     deleted: list[str] = []
     roots: list[Path]
     if year:
-        roots = [archive_dir_for_year(library_root, year)]
+        roots = [archive_dir_for_year(download_root, year)]
     else:
-        base = Path(library_root)
-        roots = [path / "Archive" for path in base.iterdir() if path.is_dir() and path.name != "Archive"]
+        base = Path(download_root)
+        if not base.exists():
+            return deleted
+        roots = [path for path in base.iterdir() if path.is_dir()]
 
     for archive_root in roots:
         if not archive_root.exists():
@@ -343,10 +371,29 @@ def _matching_archive_candidates(archive_root: Path, folder_name: str, fallback_
     if not prefixes:
         return []
 
+    normalized_prefixes = tuple(_normalize_for_matching(prefix) for prefix in prefixes)
     candidates: list[Path] = []
     for path in archive_root.iterdir():
         if not path.is_file() or path.suffix.lower() != ".zip":
             continue
-        if any(path.stem.startswith(prefix) for prefix in prefixes):
+        normalized_stem = _normalize_for_matching(path.stem)
+        if any(normalized_stem.startswith(prefix) for prefix in normalized_prefixes):
             candidates.append(path)
     return candidates
+
+
+def _matching_extract_dir(year_root: Path, folder_name: str, fallback_name: str) -> Path | None:
+    normalized_targets = {_normalize_for_matching(value) for value in (folder_name, fallback_name) if value}
+    if not normalized_targets:
+        return None
+
+    for path in sorted(year_root.iterdir()):
+        if not path.is_dir():
+            continue
+        if _normalize_for_matching(path.name) in normalized_targets:
+            return path
+    return None
+
+
+def _normalize_for_matching(value: str) -> str:
+    return unicodedata.normalize("NFC", value).casefold()

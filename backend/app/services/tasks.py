@@ -10,7 +10,9 @@ from sqlalchemy.orm import Session
 
 from app.db.models import (
     Artifact,
+    DownloadFailureKind,
     Post,
+    PostOperationStatus,
     PostStatus,
     RefreshMode,
     Settings,
@@ -21,7 +23,13 @@ from app.db.models import (
     TitleAnnotationStatus,
 )
 from app.db.session import SessionLocal
-from app.services.fanbox import ExistingPostSnapshot, FanboxAuthError, open_login_window, refresh_posts
+from app.services.fanbox import (
+    ExistingPostSnapshot,
+    FanboxAuthError,
+    FanboxConfigurationError,
+    open_login_window,
+    refresh_posts,
+)
 from app.services.files import (
     build_post_storage_paths,
     delete_archive_file,
@@ -29,10 +37,18 @@ from app.services.files import (
     ensure_directories,
     extract_zip,
     reconcile_archive_path,
+    reconcile_extract_dir,
     rename_images,
     serialize_processed_files,
 )
-from app.services.mega import MegaDownloadError, download_public_link
+from app.services.mega import (
+    MegaCommandConfigurationError,
+    MegaDownloadError,
+    classify_mega_download_failure,
+    describe_mega_download_failure,
+    download_public_link,
+    resolve_mega_command,
+)
 from app.services.title_annotation import (
     TitleAnnotationResult,
     find_completed_annotation_for_same_title,
@@ -72,23 +88,26 @@ class TaskManager:
                 task.finished_at = datetime.now(timezone.utc)
 
                 if task.post is not None and task.kind == TaskKind.DOWNLOAD_POST.value:
-                    task.post.status = (
-                        PostStatus.MISSING_LOCAL.value if task.post.mega_url else PostStatus.FAILED_PARSE.value
-                    )
+                    task.post.status = _fallback_post_inventory_status(task.post)
+                    task.post.operation_status = PostOperationStatus.FAILED_DOWNLOAD.value
                     task.post.last_error = interrupted_message
+                    task.post.download_failure_kind = DownloadFailureKind.RETRYABLE.value
+                    task.post.download_return_code = None
+                    task.download_failure_kind = DownloadFailureKind.RETRYABLE.value
+                    task.download_return_code = None
             session.commit()
 
     def set_download_concurrency(self, value: int) -> None:
         self._download_concurrency = max(1, value)
         self._download_semaphore = asyncio.Semaphore(self._download_concurrency)
 
-    def enqueue_refresh(self, mode: RefreshMode = RefreshMode.INCREMENTAL) -> str:
+    def enqueue_refresh(self, mode: RefreshMode = RefreshMode.INCREMENTAL, auto_rescan_after: bool = False) -> str:
         with SessionLocal() as session:
             active_task = self._find_active_refresh_task(session)
             if active_task is not None:
                 return active_task.id
         task_id = self._create_task(TaskKind.REFRESH_POSTS, refresh_mode=mode)
-        self._running_tasks[task_id] = asyncio.create_task(self._run_refresh(task_id, mode))
+        self._running_tasks[task_id] = asyncio.create_task(self._run_refresh(task_id, mode, auto_rescan_after))
         return task_id
 
     def enqueue_login(self) -> str:
@@ -114,9 +133,15 @@ class TaskManager:
     def enqueue_downloads(self, post_ids: list[str]) -> list[str]:
         created: list[str] = []
         with SessionLocal() as session:
+            settings = session.get(Settings, 1)
+            assert settings is not None
             posts = session.query(Post).filter(Post.post_id.in_(post_ids)).all()
+            self._validate_download_command_for_posts(session, settings, posts)
             for post in posts:
-                post.status = PostStatus.QUEUED.value
+                post.operation_status = PostOperationStatus.QUEUED.value
+                post.last_error = None
+                post.download_failure_kind = None
+                post.download_return_code = None
                 task_id = self._create_task(TaskKind.DOWNLOAD_POST, post=post, session=session)
                 created.append(task_id)
                 self._running_tasks[task_id] = asyncio.create_task(self._run_download(task_id, post.id))
@@ -124,6 +149,10 @@ class TaskManager:
         return created
 
     def enqueue_rescan(self) -> str:
+        with SessionLocal() as session:
+            active_task = self._find_active_rescan_task(session)
+            if active_task is not None:
+                return active_task.id
         task_id = self._create_task(TaskKind.RESCAN_LIBRARY)
         self._running_tasks[task_id] = asyncio.create_task(self._run_rescan(task_id))
         return task_id
@@ -173,7 +202,7 @@ class TaskManager:
                 db.close()
         return task_id
 
-    async def _run_refresh(self, task_id: str, mode: RefreshMode) -> None:
+    async def _run_refresh(self, task_id: str, mode: RefreshMode, auto_rescan_after: bool = False) -> None:
         try:
             self._mark_started(
                 task_id,
@@ -212,6 +241,7 @@ class TaskManager:
                             cover_url=item.cover_url,
                             mega_url=item.mega_url,
                             status=item.status,
+                            operation_status=PostOperationStatus.IDLE.value,
                             last_error=item.last_error,
                         )
                         session.add(existing)
@@ -238,6 +268,10 @@ class TaskManager:
                 progress_current=progress_current,
                 progress_total=final_total,
             )
+            if auto_rescan_after:
+                self.enqueue_rescan()
+        except FanboxConfigurationError as exc:
+            self._mark_failed(task_id, TaskStatus.FAILED_CONFIG.value, str(exc))
         except FanboxAuthError as exc:
             self._mark_failed(task_id, TaskStatus.FAILED_AUTH.value, str(exc))
         except TimeoutError:
@@ -406,6 +440,7 @@ class TaskManager:
                     existing_archive_path = reconcile_archive_path(
                         current_archive_path=artifact.archive_path if artifact else None,
                         library_root=settings.library_dir,
+                        download_root=settings.download_dir,
                         title=post.title,
                         published_at=post.published_at,
                         fallback_name=post.post_id,
@@ -414,16 +449,13 @@ class TaskManager:
                     mega_command = settings.mega_command
                     auto_delete_archive = settings.auto_delete_archive
 
-                self._mark_post_status(post_db_id, PostStatus.RUNNING_DOWNLOAD.value)
                 if existing_archive_path:
                     archive_path = existing_archive_path
-                    self._mark_started(
-                        task_id,
-                        TaskStatus.RUNNING_DOWNLOAD.value,
-                        "Using existing archive from local Archive folder.",
-                    )
+                    self._mark_post_operation_status(post_db_id, PostOperationStatus.RUNNING_EXTRACT.value)
+                    self._mark_started(task_id, TaskStatus.RUNNING_EXTRACT.value, "Extracting existing archive from local download folder.")
                     self._append_log(task_id, f"Reused existing archive: {archive_path}")
                 else:
+                    self._mark_post_operation_status(post_db_id, PostOperationStatus.RUNNING_DOWNLOAD.value)
                     self._mark_started(task_id, TaskStatus.RUNNING_DOWNLOAD.value, "Downloading archive from MEGA.")
                     archive_path, mega_log = await asyncio.wait_for(
                         self._download_archive_with_retries(mega_url, paths.download_dir, mega_command),
@@ -431,11 +463,11 @@ class TaskManager:
                     )
                     self._append_log(task_id, mega_log)
 
-                self._mark_post_status(post_db_id, PostStatus.RUNNING_EXTRACT.value)
+                    self._mark_post_operation_status(post_db_id, PostOperationStatus.RUNNING_EXTRACT.value)
                 self._update_task_status(task_id, TaskStatus.RUNNING_EXTRACT.value, "Extracting zip archive.")
                 extract_zip(archive_path, paths.extract_dir)
 
-                self._mark_post_status(post_db_id, PostStatus.RUNNING_RENAME.value)
+                self._mark_post_operation_status(post_db_id, PostOperationStatus.RUNNING_RENAME.value)
                 self._update_task_status(task_id, TaskStatus.RUNNING_RENAME.value, "Renaming extracted image files.")
                 rename_changes = rename_images(paths.extract_dir)
                 stored_archive_path = archive_path
@@ -454,22 +486,59 @@ class TaskManager:
                     post = session.get(Post, post_db_id)
                     assert post is not None
                     post.status = PostStatus.COMPLETED.value
+                    post.operation_status = PostOperationStatus.IDLE.value
                     post.last_error = None
+                    post.download_failure_kind = None
+                    post.download_return_code = None
+                    task = session.get(Task, task_id)
+                    assert task is not None
+                    task.status = TaskStatus.COMPLETED.value
+                    task.message = "Archive processing finished."
+                    task.error = None
+                    task.download_failure_kind = None
+                    task.download_return_code = None
+                    task.finished_at = datetime.now(timezone.utc)
                     session.commit()
-
-                self._mark_completed(task_id, "Download, extraction, and rename finished.")
+        except MegaCommandConfigurationError as exc:
+            self._mark_post_download_failed(post_db_id, PostOperationStatus.FAILED_CONFIG.value, str(exc))
+            self._mark_failed(task_id, TaskStatus.FAILED_CONFIG.value, str(exc))
         except MegaDownloadError as exc:
-            self._mark_post_status(post_db_id, PostStatus.FAILED_DOWNLOAD.value, str(exc))
-            self._mark_failed(task_id, TaskStatus.FAILED_DOWNLOAD.value, str(exc))
+            failure_kind = classify_mega_download_failure(exc.return_code, exc.output)
+            error_message = describe_mega_download_failure(failure_kind, exc.return_code, exc.output)
+            self._append_log(task_id, exc.output)
+            self._mark_post_download_failed(
+                post_db_id,
+                PostOperationStatus.FAILED_DOWNLOAD.value,
+                error_message,
+                failure_kind=failure_kind.value,
+                return_code=exc.return_code,
+            )
+            self._mark_failed(
+                task_id,
+                TaskStatus.FAILED_DOWNLOAD.value,
+                error_message,
+                failure_kind=failure_kind.value,
+                return_code=exc.return_code,
+            )
         except TimeoutError:
             timeout_message = f"Download timed out after {_resolve_download_timeout_seconds()} seconds."
-            self._mark_post_status(post_db_id, PostStatus.FAILED_DOWNLOAD.value, timeout_message)
-            self._mark_failed(task_id, TaskStatus.FAILED_DOWNLOAD.value, timeout_message)
+            self._mark_post_download_failed(
+                post_db_id,
+                PostOperationStatus.FAILED_DOWNLOAD.value,
+                timeout_message,
+                failure_kind=DownloadFailureKind.RETRYABLE.value,
+            )
+            self._mark_failed(
+                task_id,
+                TaskStatus.FAILED_DOWNLOAD.value,
+                timeout_message,
+                failure_kind=DownloadFailureKind.RETRYABLE.value,
+            )
         except ValueError as exc:
-            self._mark_post_status(post_db_id, PostStatus.FAILED_EXTRACT.value, str(exc))
+            self._mark_post_download_failed(post_db_id, PostOperationStatus.FAILED_EXTRACT.value, str(exc))
             self._mark_failed(task_id, TaskStatus.FAILED_EXTRACT.value, str(exc))
         except Exception as exc:
-            self._mark_post_status(post_db_id, PostStatus.FAILED_RENAME.value, str(exc))
+            self._mark_post_download_failed(post_db_id, PostOperationStatus.FAILED_RENAME.value, str(exc))
             self._mark_failed(task_id, TaskStatus.FAILED_RENAME.value, str(exc))
         finally:
             self._running_tasks.pop(task_id, None)
@@ -506,18 +575,34 @@ class TaskManager:
         artifact.archive_path = reconcile_archive_path(
             current_archive_path=artifact.archive_path,
             library_root=settings.library_dir,
+            download_root=settings.download_dir,
+            title=post.title,
+            published_at=post.published_at,
+            fallback_name=post.post_id,
+        )
+        resolved_extract_dir = reconcile_extract_dir(
+            current_extract_dir=artifact.extract_dir,
+            library_root=settings.library_dir,
             title=post.title,
             published_at=post.published_at,
             fallback_name=post.post_id,
         )
 
-        if directory_has_content(paths.extract_dir):
-            artifact.extract_dir = paths.extract_dir
+        if directory_has_content(resolved_extract_dir):
+            artifact.extract_dir = resolved_extract_dir
             post.status = PostStatus.COMPLETED.value
+            post.operation_status = PostOperationStatus.IDLE.value
             post.last_error = None
+            post.download_failure_kind = None
+            post.download_return_code = None
         elif post.mega_url:
-            artifact.extract_dir = paths.extract_dir
+            artifact.extract_dir = resolved_extract_dir
             post.status = PostStatus.MISSING_LOCAL.value
+            if artifact.archive_path:
+                post.operation_status = PostOperationStatus.IDLE.value
+                post.last_error = None
+                post.download_failure_kind = None
+                post.download_return_code = None
 
     def _build_existing_post_snapshots(self, session: Session) -> dict[str, ExistingPostSnapshot]:
         posts = session.query(Post).all()
@@ -560,6 +645,36 @@ class TaskManager:
         post.title_annotation_error = result.error
         post.title_annotation_updated_at = datetime.now(timezone.utc)
 
+    def _validate_download_command_for_posts(self, session: Session, settings: Settings, posts: list[Post]) -> None:
+        command_checked = False
+
+        for post in posts:
+            if not post.mega_url:
+                continue
+
+            paths = build_post_storage_paths(
+                library_root=settings.library_dir,
+                download_root=settings.download_dir,
+                title=post.title,
+                published_at=post.published_at,
+                fallback_name=post.post_id,
+            )
+            artifact = session.query(Artifact).filter_by(post_id=post.id).one_or_none()
+            existing_archive_path = reconcile_archive_path(
+                current_archive_path=artifact.archive_path if artifact else None,
+                library_root=settings.library_dir,
+                download_root=settings.download_dir,
+                title=post.title,
+                published_at=post.published_at,
+                fallback_name=post.post_id,
+            )
+            if existing_archive_path:
+                continue
+
+            if not command_checked:
+                resolve_mega_command(settings.mega_command)
+                command_checked = True
+
     def _find_active_refresh_task(self, session: Session) -> Task | None:
         return (
             session.query(Task)
@@ -577,6 +692,17 @@ class TaskManager:
             .filter(
                 Task.kind == TaskKind.ANNOTATE_TITLES.value,
                 Task.status.in_([TaskStatus.QUEUED.value, TaskStatus.RUNNING_ANNOTATE.value]),
+            )
+            .order_by(Task.created_at.desc())
+            .first()
+        )
+
+    def _find_active_rescan_task(self, session: Session) -> Task | None:
+        return (
+            session.query(Task)
+            .filter(
+                Task.kind == TaskKind.RESCAN_LIBRARY.value,
+                Task.status.in_([TaskStatus.QUEUED.value, TaskStatus.RUNNING_REFRESH.value]),
             )
             .order_by(Task.created_at.desc())
             .first()
@@ -652,13 +778,23 @@ class TaskManager:
             task.finished_at = datetime.now(timezone.utc)
             session.commit()
 
-    def _mark_failed(self, task_id: str, status: str, error: str) -> None:
+    def _mark_failed(
+        self,
+        task_id: str,
+        status: str,
+        error: str,
+        *,
+        failure_kind: str | None = None,
+        return_code: int | None = None,
+    ) -> None:
         with SessionLocal() as session:
             task = session.get(Task, task_id)
             if task is None:
                 return
             task.status = status
             task.error = error
+            task.download_failure_kind = failure_kind
+            task.download_return_code = return_code
             task.finished_at = datetime.now(timezone.utc)
             session.commit()
 
@@ -670,14 +806,34 @@ class TaskManager:
             task.log = "\n".join(filter(None, [task.log, log_line]))
             session.commit()
 
-    def _mark_post_status(self, post_db_id: int, status: str, error: str | None = None) -> None:
+    def _mark_post_operation_status(self, post_db_id: int, status: str, error: str | None = None) -> None:
         with SessionLocal() as session:
             post = session.get(Post, post_db_id)
             if post is None:
                 return
-            post.status = status
+            post.operation_status = status
             if error:
                 post.last_error = error
+            session.commit()
+
+    def _mark_post_download_failed(
+        self,
+        post_db_id: int,
+        operation_status: str,
+        error: str,
+        *,
+        failure_kind: str | None = None,
+        return_code: int | None = None,
+    ) -> None:
+        with SessionLocal() as session:
+            post = session.get(Post, post_db_id)
+            if post is None:
+                return
+            post.status = _fallback_post_inventory_status(post)
+            post.operation_status = operation_status
+            post.last_error = error
+            post.download_failure_kind = failure_kind
+            post.download_return_code = return_code
             session.commit()
 
     async def _download_archive_with_retries(self, mega_url: str, download_dir: str, mega_command: str) -> tuple[str, str]:
@@ -693,15 +849,20 @@ class TaskManager:
                 return archive_path, mega_log
             except MegaDownloadError as exc:
                 last_error = exc
-                message = str(exc)
+                message = exc.output
                 logs.append(message)
-                if attempt >= attempts or "Failed to access server: 231" not in message:
+                failure_kind = classify_mega_download_failure(exc.return_code, exc.output)
+                if attempt >= attempts or failure_kind != DownloadFailureKind.RETRYABLE:
                     break
                 logs.append(f"Retrying MEGA download ({attempt + 1}/{attempts}) after temporary server access failure.")
                 await asyncio.sleep(3)
 
         assert last_error is not None
-        raise MegaDownloadError("\n".join(logs) if logs else str(last_error))
+        raise MegaDownloadError(
+            "\n".join(logs) if logs else str(last_error),
+            return_code=last_error.return_code,
+            output="\n".join(logs) if logs else last_error.output,
+        )
 
 
 def _resolve_download_concurrency() -> int:
@@ -711,6 +872,10 @@ def _resolve_download_concurrency() -> int:
     except ValueError:
         return 5
     return max(1, concurrency)
+
+
+def _fallback_post_inventory_status(post: Post) -> str:
+    return PostStatus.MISSING_LOCAL.value if post.mega_url else PostStatus.FAILED_PARSE.value
 
 
 def _resolve_download_timeout_seconds() -> int:

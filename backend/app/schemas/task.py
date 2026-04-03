@@ -13,6 +13,8 @@ class TaskRead(BaseModel):
     post_id: int | None
     message: str | None
     error: str | None
+    download_failure_kind: str | None = None
+    download_return_code: int | None = None
     log: str | None
     progress_current: int | None
     progress_total: int | None

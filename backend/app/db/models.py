@@ -16,16 +16,35 @@ class Base(DeclarativeBase):
 class PostStatus(StrEnum):
     NEW = "new"
     MISSING_LOCAL = "missing_local"
+    COMPLETED = "completed"
+    FAILED_PARSE = "failed_parse"
+    AUTH_EXPIRED = "auth_expired"
+
+
+class PostOperationStatus(StrEnum):
+    IDLE = "idle"
     QUEUED = "queued"
     RUNNING_DOWNLOAD = "running_download"
     RUNNING_EXTRACT = "running_extract"
     RUNNING_RENAME = "running_rename"
-    COMPLETED = "completed"
-    FAILED_PARSE = "failed_parse"
+    FAILED_CONFIG = "failed_config"
     FAILED_DOWNLOAD = "failed_download"
     FAILED_EXTRACT = "failed_extract"
     FAILED_RENAME = "failed_rename"
-    AUTH_EXPIRED = "auth_expired"
+
+
+class PostPrimaryAction(StrEnum):
+    DOWNLOAD = "download"
+    EXTRACT = "extract"
+    REDOWNLOAD = "redownload"
+    STALE_LINK = "stale_link"
+    COMPLETED = "completed"
+
+
+class DownloadFailureKind(StrEnum):
+    RETRYABLE = "retryable"
+    UNAVAILABLE = "unavailable"
+    UNKNOWN = "unknown"
 
 
 class TaskStatus(StrEnum):
@@ -37,6 +56,7 @@ class TaskStatus(StrEnum):
     RUNNING_ANNOTATE = "running_annotate"
     RUNNING_LOGIN = "running_login"
     COMPLETED = "completed"
+    FAILED_CONFIG = "failed_config"
     FAILED_DOWNLOAD = "failed_download"
     FAILED_EXTRACT = "failed_extract"
     FAILED_RENAME = "failed_rename"
@@ -120,6 +140,9 @@ class Post(Base):
     title_annotation_error: Mapped[str | None] = mapped_column(Text, nullable=True)
     title_annotation_updated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     status: Mapped[str] = mapped_column(String(50), default=PostStatus.NEW.value)
+    operation_status: Mapped[str] = mapped_column(String(50), default=PostOperationStatus.IDLE.value)
+    download_failure_kind: Mapped[str | None] = mapped_column(String(30), nullable=True)
+    download_return_code: Mapped[int | None] = mapped_column(nullable=True)
     last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
     discovered_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(
@@ -155,6 +178,8 @@ class Task(Base):
     post_id: Mapped[int | None] = mapped_column(ForeignKey("posts.id"), nullable=True, index=True)
     message: Mapped[str | None] = mapped_column(Text, nullable=True)
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    download_failure_kind: Mapped[str | None] = mapped_column(String(30), nullable=True)
+    download_return_code: Mapped[int | None] = mapped_column(nullable=True)
     log: Mapped[str | None] = mapped_column(Text, nullable=True)
     progress_current: Mapped[int | None] = mapped_column(nullable=True)
     progress_total: Mapped[int | None] = mapped_column(nullable=True)

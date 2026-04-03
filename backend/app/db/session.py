@@ -7,7 +7,7 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from app.core.config import get_config
 from app.core.default_settings import build_default_settings, is_empty_setting_value
-from app.db.models import Base, Settings, TitleAnnotationStatus
+from app.db.models import Base, Post, PostOperationStatus, PostStatus, Settings, TitleAnnotationStatus
 
 
 config = get_config()
@@ -111,6 +111,18 @@ def _apply_runtime_migrations() -> None:
             connection.execute(text("ALTER TABLE posts ADD COLUMN title_annotation_error TEXT"))
         if "title_annotation_updated_at" not in post_columns:
             connection.execute(text("ALTER TABLE posts ADD COLUMN title_annotation_updated_at DATETIME"))
+        if "operation_status" not in post_columns:
+            connection.execute(
+                text(
+                    "ALTER TABLE posts ADD COLUMN operation_status VARCHAR(50) "
+                    f"NOT NULL DEFAULT '{PostOperationStatus.IDLE.value}'"
+                )
+            )
+        if "download_failure_kind" not in post_columns:
+            connection.execute(text("ALTER TABLE posts ADD COLUMN download_failure_kind VARCHAR(30)"))
+        if "download_return_code" not in post_columns:
+            connection.execute(text("ALTER TABLE posts ADD COLUMN download_return_code INTEGER"))
+    _migrate_post_statuses_to_inventory_and_operation()
     task_columns = {column["name"] for column in inspector.get_columns("tasks")} if "tasks" in inspector.get_table_names() else set()
     with engine.begin() as connection:
         if "progress_current" not in task_columns:
@@ -119,3 +131,61 @@ def _apply_runtime_migrations() -> None:
             connection.execute(text("ALTER TABLE tasks ADD COLUMN progress_total INTEGER"))
         if "refresh_mode" not in task_columns:
             connection.execute(text("ALTER TABLE tasks ADD COLUMN refresh_mode VARCHAR(20)"))
+        if "download_failure_kind" not in task_columns:
+            connection.execute(text("ALTER TABLE tasks ADD COLUMN download_failure_kind VARCHAR(30)"))
+        if "download_return_code" not in task_columns:
+            connection.execute(text("ALTER TABLE tasks ADD COLUMN download_return_code INTEGER"))
+
+
+def _migrate_post_statuses_to_inventory_and_operation() -> None:
+    with SessionLocal() as session:
+        posts = session.query(Post).all()
+        updated = False
+        for post in posts:
+            inventory_status, operation_status = _split_legacy_post_status(
+                status=post.status,
+                mega_url=post.mega_url,
+                current_operation_status=post.operation_status,
+            )
+            if post.status != inventory_status:
+                post.status = inventory_status
+                updated = True
+            if post.operation_status != operation_status:
+                post.operation_status = operation_status
+                updated = True
+        if updated:
+            session.commit()
+
+
+def _split_legacy_post_status(
+    status: str | None,
+    mega_url: str | None,
+    current_operation_status: str | None,
+) -> tuple[str, str]:
+    fallback_inventory = PostStatus.MISSING_LOCAL.value if mega_url else PostStatus.FAILED_PARSE.value
+    normalized_status = (status or "").strip() or PostStatus.NEW.value
+    normalized_operation_status = (current_operation_status or "").strip() or PostOperationStatus.IDLE.value
+
+    if normalized_status in {
+        PostStatus.NEW.value,
+        PostStatus.MISSING_LOCAL.value,
+        PostStatus.COMPLETED.value,
+        PostStatus.FAILED_PARSE.value,
+        PostStatus.AUTH_EXPIRED.value,
+    }:
+        return normalized_status, normalized_operation_status
+
+    operation_status_map = {
+        PostOperationStatus.QUEUED.value: PostOperationStatus.QUEUED.value,
+        PostOperationStatus.RUNNING_DOWNLOAD.value: PostOperationStatus.RUNNING_DOWNLOAD.value,
+        PostOperationStatus.RUNNING_EXTRACT.value: PostOperationStatus.RUNNING_EXTRACT.value,
+        PostOperationStatus.RUNNING_RENAME.value: PostOperationStatus.RUNNING_RENAME.value,
+        PostOperationStatus.FAILED_CONFIG.value: PostOperationStatus.FAILED_CONFIG.value,
+        PostOperationStatus.FAILED_DOWNLOAD.value: PostOperationStatus.FAILED_DOWNLOAD.value,
+        PostOperationStatus.FAILED_EXTRACT.value: PostOperationStatus.FAILED_EXTRACT.value,
+        PostOperationStatus.FAILED_RENAME.value: PostOperationStatus.FAILED_RENAME.value,
+    }
+    if normalized_status in operation_status_map:
+        return fallback_inventory, operation_status_map[normalized_status]
+
+    return fallback_inventory, normalized_operation_status

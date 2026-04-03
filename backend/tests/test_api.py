@@ -8,10 +8,21 @@ TEST_DB = Path(__file__).resolve().parents[1] / "data" / "test.db"
 
 from app.core.config import get_config
 from app.core.default_settings import build_default_settings
-from app.db.models import Artifact, Post, PostStatus, RefreshMode, Settings, Task, TaskKind, TaskStatus
+from app.db.models import (
+    Artifact,
+    DownloadFailureKind,
+    Post,
+    PostStatus,
+    RefreshMode,
+    Settings,
+    Task,
+    TaskKind,
+    TaskStatus,
+)
 from app.db.session import engine, init_db
 from app.db.session import SessionLocal
 from app.main import app
+from app.services.mega import MegaCommandConfigurationError
 
 
 def setup_function() -> None:
@@ -188,6 +199,34 @@ def test_clear_title_annotation_cache_resets_posts_to_pending_or_skipped() -> No
         assert skipped.title_annotation_status == "skipped"
 
 
+def test_download_tasks_reject_invalid_mega_command(monkeypatch) -> None:
+    with SessionLocal() as session:
+        settings = session.get(Settings, 1)
+        assert settings is not None
+        settings.mega_command = "mega-get"
+        session.add(
+            Post(
+                post_id="51000001",
+                title="download config",
+                detail_url="https://siu.fanbox.cc/posts/51000001",
+                mega_url="https://mega.nz/file/download-config",
+                status=PostStatus.MISSING_LOCAL.value,
+            )
+        )
+        session.commit()
+
+    def fake_resolve_mega_command(*_args, **_kwargs):
+        raise MegaCommandConfigurationError("当前下载命令不可用，请先在设置中填写可用的 mega-get 可执行文件或目录。")
+
+    monkeypatch.setattr("app.services.tasks.resolve_mega_command", fake_resolve_mega_command)
+
+    client = TestClient(app)
+    response = client.post("/api/tasks/download", json={"post_ids": ["51000001"]})
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == "当前下载命令不可用，请先在设置中填写可用的 mega-get 可执行文件或目录。"
+
+
 def test_posts_expose_needs_title_annotation_flag() -> None:
     with SessionLocal() as session:
         session.add_all(
@@ -215,6 +254,82 @@ def test_posts_expose_needs_title_annotation_flag() -> None:
     posts = {item["post_id"]: item for item in response.json()["data"]}
     assert posts["41000010"]["needs_title_annotation"] is True
     assert posts["41000011"]["needs_title_annotation"] is False
+    assert posts["41000010"]["operation_status"] == "idle"
+    assert posts["41000010"]["primary_action"] == "download"
+
+
+def test_posts_expose_primary_action_variants(tmp_path: Path) -> None:
+    extract_dir = tmp_path / "library" / "2026" / "extract-me"
+    completed_dir = tmp_path / "library" / "2026" / "completed"
+    archive_path = tmp_path / "downloads" / "2026" / "extract-me.zip"
+    extract_dir.mkdir(parents=True, exist_ok=True)
+    completed_dir.mkdir(parents=True, exist_ok=True)
+    archive_path.parent.mkdir(parents=True, exist_ok=True)
+    archive_path.write_bytes(b"zip")
+
+    with SessionLocal() as session:
+        download_post = Post(
+            post_id="41000100",
+            title="download",
+            detail_url="https://siu.fanbox.cc/posts/41000100",
+            mega_url="https://mega.nz/file/download",
+            status=PostStatus.MISSING_LOCAL.value,
+        )
+        extract_post = Post(
+            post_id="41000101",
+            title="extract",
+            detail_url="https://siu.fanbox.cc/posts/41000101",
+            mega_url="https://mega.nz/file/extract",
+            status=PostStatus.MISSING_LOCAL.value,
+        )
+        retry_post = Post(
+            post_id="41000102",
+            title="retry",
+            detail_url="https://siu.fanbox.cc/posts/41000102",
+            mega_url="https://mega.nz/file/retry",
+            status=PostStatus.MISSING_LOCAL.value,
+            operation_status="failed_extract",
+        )
+        stale_link_post = Post(
+            post_id="41000104",
+            title="stale link",
+            detail_url="https://siu.fanbox.cc/posts/41000104",
+            mega_url="https://mega.nz/file/stale-link",
+            status=PostStatus.MISSING_LOCAL.value,
+            operation_status="failed_download",
+            download_failure_kind=DownloadFailureKind.UNAVAILABLE.value,
+            download_return_code=9,
+            last_error="当前 MEGA 链接已失效，无法继续下载。",
+        )
+        completed_post = Post(
+            post_id="41000103",
+            title="completed",
+            detail_url="https://siu.fanbox.cc/posts/41000103",
+            mega_url="https://mega.nz/file/completed",
+            status=PostStatus.COMPLETED.value,
+        )
+        session.add_all([download_post, extract_post, retry_post, stale_link_post, completed_post])
+        session.flush()
+        session.add_all(
+            [
+                Artifact(post_id=extract_post.id, archive_path=str(archive_path), extract_dir=str(extract_dir), processed_files="[]"),
+                Artifact(post_id=completed_post.id, archive_path=None, extract_dir=str(completed_dir), processed_files="[]"),
+            ]
+        )
+        session.commit()
+
+    client = TestClient(app)
+    response = client.get("/api/posts")
+
+    assert response.status_code == 200
+    posts = {item["post_id"]: item for item in response.json()["data"]}
+    assert posts["41000100"]["primary_action"] == "download"
+    assert posts["41000101"]["primary_action"] == "extract"
+    assert posts["41000102"]["primary_action"] == "redownload"
+    assert posts["41000104"]["primary_action"] == "stale_link"
+    assert posts["41000104"]["download_failure_kind"] == "unavailable"
+    assert posts["41000104"]["download_return_code"] == 9
+    assert posts["41000103"]["primary_action"] == "completed"
 
 
 def test_upsert_title_aliases_writes_full_title_entry(tmp_path: Path) -> None:
@@ -329,6 +444,37 @@ def test_posts_deduped_by_mega_url_keep_smaller_post_id() -> None:
     assert "20000100" in returned_post_ids
     unique_post = next(item for item in response.json()["data"] if item["post_id"] == "20000100")
     assert unique_post["cover_url"] == "https://example.com/cover.jpg"
+
+
+def test_posts_with_same_published_at_sort_by_numeric_post_id_desc_not_updated_at() -> None:
+    with SessionLocal() as session:
+        earlier_updated = Post(
+            post_id="11503181",
+            title="same published smaller id",
+            published_at=datetime(2026, 3, 14, 8, 0),
+            detail_url="https://siu.fanbox.cc/posts/11503181",
+            mega_url="https://mega.nz/file/11503181",
+            status=PostStatus.MISSING_LOCAL.value,
+            updated_at=datetime(2026, 4, 3, 0, 59, 30),
+        )
+        later_updated = Post(
+            post_id="11518354",
+            title="same published larger id",
+            published_at=datetime(2026, 3, 14, 8, 0),
+            detail_url="https://siu.fanbox.cc/posts/11518354",
+            mega_url="https://mega.nz/file/11518354",
+            status=PostStatus.MISSING_LOCAL.value,
+            updated_at=datetime(2026, 4, 3, 0, 57, 9),
+        )
+        session.add_all([earlier_updated, later_updated])
+        session.commit()
+
+    client = TestClient(app)
+    response = client.get("/api/posts")
+
+    assert response.status_code == 200
+    returned_post_ids = [item["post_id"] for item in response.json()["data"]]
+    assert returned_post_ids[:2] == ["11518354", "11503181"]
 
 
 def test_posts_include_display_title_when_annotation_exists() -> None:
@@ -514,10 +660,10 @@ def test_clear_tasks_rejects_when_active_tasks_exist() -> None:
 
 
 def test_refresh_endpoint_defaults_to_incremental(monkeypatch) -> None:
-    captured: list[str] = []
+    captured: list[tuple[str, bool]] = []
 
-    def fake_enqueue_refresh(mode: RefreshMode) -> str:
-        captured.append(mode.value)
+    def fake_enqueue_refresh(mode: RefreshMode, auto_rescan_after: bool = False) -> str:
+        captured.append((mode.value, auto_rescan_after))
         return "refresh-task-default"
 
     monkeypatch.setattr(main_module.task_manager, "enqueue_refresh", fake_enqueue_refresh)
@@ -526,15 +672,15 @@ def test_refresh_endpoint_defaults_to_incremental(monkeypatch) -> None:
     response = client.post("/api/posts/refresh")
 
     assert response.status_code == 200
-    assert captured == ["incremental"]
+    assert captured == [("incremental", False)]
     assert response.json()["data"]["task_id"] == "refresh-task-default"
 
 
 def test_refresh_endpoint_supports_full_mode(monkeypatch) -> None:
-    captured: list[str] = []
+    captured: list[tuple[str, bool]] = []
 
-    def fake_enqueue_refresh(mode: RefreshMode) -> str:
-        captured.append(mode.value)
+    def fake_enqueue_refresh(mode: RefreshMode, auto_rescan_after: bool = False) -> str:
+        captured.append((mode.value, auto_rescan_after))
         return "refresh-task-full"
 
     monkeypatch.setattr(main_module.task_manager, "enqueue_refresh", fake_enqueue_refresh)
@@ -543,8 +689,25 @@ def test_refresh_endpoint_supports_full_mode(monkeypatch) -> None:
     response = client.post("/api/posts/refresh", json={"mode": "full"})
 
     assert response.status_code == 200
-    assert captured == ["full"]
+    assert captured == [("full", False)]
     assert response.json()["data"]["task_id"] == "refresh-task-full"
+
+
+def test_refresh_endpoint_can_request_auto_rescan_after(monkeypatch) -> None:
+    captured: list[tuple[str, bool]] = []
+
+    def fake_enqueue_refresh(mode: RefreshMode, auto_rescan_after: bool = False) -> str:
+        captured.append((mode.value, auto_rescan_after))
+        return "refresh-task-with-rescan"
+
+    monkeypatch.setattr(main_module.task_manager, "enqueue_refresh", fake_enqueue_refresh)
+    client = TestClient(app)
+
+    response = client.post("/api/posts/refresh", json={"mode": "incremental", "auto_rescan_after": True})
+
+    assert response.status_code == 200
+    assert captured == [("incremental", True)]
+    assert response.json()["data"]["task_id"] == "refresh-task-with-rescan"
 
 
 def test_open_local_path_endpoint_opens_extract_dir(monkeypatch, tmp_path: Path) -> None:
@@ -621,3 +784,55 @@ def test_open_year_folder_endpoint_opens_selected_year(monkeypatch, tmp_path: Pa
     assert response.status_code == 200
     assert response.json()["data"]["opened_path"] == str(year_dir)
     assert opened_paths == [str(year_dir)]
+
+
+def test_purge_archives_endpoint_removes_download_dir_archives(tmp_path: Path) -> None:
+    download_root = tmp_path / "downloads"
+    library_root = tmp_path / "library"
+    archive_dir = download_root / "2026"
+    archive_dir.mkdir(parents=True)
+    library_root.mkdir(parents=True)
+    archive_path = archive_dir / "sample.zip"
+    archive_path.write_bytes(b"zip")
+
+    client = TestClient(app)
+    client.post(
+        "/api/settings",
+        json={
+            "creator_url": "https://example.fanbox.cc/posts",
+            "profile_dir": "C:/tmp/profile",
+            "download_dir": str(download_root),
+            "library_dir": str(library_root),
+            "temp_dir": "C:/tmp/temp",
+            "mega_command": "mega-get",
+            "playwright_channel": "msedge",
+            "refresh_interval_minutes": 0,
+            "download_concurrency": 4,
+            "posts_per_row": 4,
+            "auto_delete_archive": True,
+        },
+    )
+
+    with SessionLocal() as session:
+        post = Post(
+            post_id="40000001",
+            title="purge archive",
+            published_at=datetime(2026, 1, 1, 12, 0),
+            detail_url="https://example.fanbox.cc/posts/40000001",
+            mega_url="https://mega.nz/file/purge-test",
+            status=PostStatus.COMPLETED.value,
+        )
+        session.add(post)
+        session.flush()
+        session.add(Artifact(post_id=post.id, archive_path=str(archive_path), extract_dir=str(library_root / "2026" / "purge archive")))
+        session.commit()
+
+    response = client.post("/api/archives/purge", json={"year": "2026"})
+
+    assert response.status_code == 200
+    assert response.json()["data"]["deleted_count"] == 1
+    assert not archive_path.exists()
+
+    with SessionLocal() as session:
+        artifact = session.query(Artifact).one()
+        assert artifact.archive_path is None

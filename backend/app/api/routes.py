@@ -3,9 +3,22 @@ from __future__ import annotations
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy import Integer, cast
 from sqlalchemy.orm import Session
 
-from app.db.models import Artifact, Post, RefreshMode, Settings, Task, TaskStatus
+from app.db.models import (
+    Artifact,
+    DownloadFailureKind,
+    Post,
+    PostOperationStatus,
+    PostPrimaryAction,
+    PostStatus,
+    RefreshMode,
+    Settings,
+    Task,
+    TaskKind,
+    TaskStatus,
+)
 from app.db.session import get_db
 from app.schemas.archive import ArchiveActionResult, ArchiveDeleteRequest, ArchivePurgeRequest, OpenPathResult, YearOpenRequest
 from app.schemas.common import Envelope, TaskResponse
@@ -20,6 +33,7 @@ from app.schemas.settings import (
 from app.schemas.task import RetryRequest, TaskClearResult, TaskRead
 from app.services.fanbox import inspect_auth_status
 from app.services.files import delete_archive_file, open_in_explorer, purge_archive_files, resolve_post_open_path
+from app.services.mega import MegaCommandConfigurationError, classify_mega_download_failure
 from app.services.tasks import TaskManager
 from app.services.title_annotation import (
     build_display_title,
@@ -55,12 +69,51 @@ def _dedupe_posts_by_mega(posts: list[Post]) -> list[Post]:
     return [post for post in posts if post.id in selected_ids]
 
 
+def _resolve_download_failure(
+    return_code: int | None,
+    failure_kind: str | None,
+    text: str | None,
+) -> tuple[str | None, int | None]:
+    if failure_kind:
+        return failure_kind, return_code
+    if not text and return_code is None:
+        return None, return_code
+    return classify_mega_download_failure(return_code, text).value, return_code
+
+
+def _derive_post_primary_action(post: Post, artifact: Artifact | None, download_failure_kind: str | None) -> str:
+    if post.status == PostStatus.COMPLETED.value:
+        return PostPrimaryAction.COMPLETED.value
+
+    if (
+        post.operation_status == PostOperationStatus.FAILED_DOWNLOAD.value
+        and download_failure_kind == DownloadFailureKind.UNAVAILABLE.value
+    ):
+        return PostPrimaryAction.STALE_LINK.value
+
+    if post.operation_status in {
+        PostOperationStatus.FAILED_CONFIG.value,
+        PostOperationStatus.FAILED_DOWNLOAD.value,
+        PostOperationStatus.FAILED_EXTRACT.value,
+        PostOperationStatus.FAILED_RENAME.value,
+    }:
+        return PostPrimaryAction.REDOWNLOAD.value
+
+    if artifact is not None and artifact.archive_path:
+        return PostPrimaryAction.EXTRACT.value
+
+    if post.mega_url:
+        return PostPrimaryAction.DOWNLOAD.value
+
+    return PostPrimaryAction.DOWNLOAD.value
+
+
 def create_router(task_manager: TaskManager) -> APIRouter:
     router = APIRouter(prefix="/api")
 
     @router.get("/posts", response_model=Envelope[list[PostRead]])
     def list_posts(db: Session = Depends(get_db)) -> Envelope[list[PostRead]]:
-        posts = db.query(Post).order_by(Post.published_at.desc().nullslast(), Post.updated_at.desc()).all()
+        posts = db.query(Post).order_by(Post.published_at.desc().nullslast(), cast(Post.post_id, Integer).desc()).all()
         posts = _dedupe_posts_by_mega(posts)
         settings = db.get(Settings, 1)
         assert settings is not None
@@ -68,10 +121,22 @@ def create_router(task_manager: TaskManager) -> APIRouter:
         payload: list[PostRead] = []
         for post in posts:
             artifact = db.query(Artifact).filter_by(post_id=post.id).one_or_none()
+            latest_download_task = (
+                db.query(Task)
+                .filter(Task.kind == TaskKind.DOWNLOAD_POST.value, Task.post_id == post.id)
+                .order_by(Task.created_at.desc())
+                .first()
+            )
             open_path = resolve_post_open_path(
                 artifact.extract_dir if artifact else None,
                 artifact.archive_path if artifact else None,
             )
+            download_failure_kind, download_return_code = _resolve_download_failure(
+                post.download_return_code if hasattr(post, "download_return_code") else None,
+                post.download_failure_kind if hasattr(post, "download_failure_kind") else None,
+                post.last_error or (latest_download_task.error if latest_download_task else None),
+            )
+            primary_action = _derive_post_primary_action(post, artifact, download_failure_kind)
             dictionary_result = resolve_dictionary_annotation(post.title, aliases)
             effective_annotation = dictionary_result.annotation if dictionary_result and dictionary_result.annotation else post.title_annotation
             payload.append(
@@ -87,6 +152,10 @@ def create_router(task_manager: TaskManager) -> APIRouter:
                     cover_url=post.cover_url,
                     mega_url=post.mega_url,
                     status=post.status,
+                    operation_status=post.operation_status,
+                    primary_action=primary_action,
+                    download_failure_kind=download_failure_kind,
+                    download_return_code=download_return_code,
                     last_error=post.last_error,
                     archive_path=artifact.archive_path if artifact else None,
                     extract_dir=artifact.extract_dir if artifact else None,
@@ -100,7 +169,8 @@ def create_router(task_manager: TaskManager) -> APIRouter:
     @router.post("/posts/refresh", response_model=Envelope[TaskResponse])
     async def refresh_posts_endpoint(payload: RefreshRequest | None = None) -> Envelope[TaskResponse]:
         mode = RefreshMode(payload.mode) if payload is not None else RefreshMode.INCREMENTAL
-        task_id = task_manager.enqueue_refresh(mode)
+        auto_rescan_after = payload.auto_rescan_after if payload is not None else False
+        task_id = task_manager.enqueue_refresh(mode, auto_rescan_after=auto_rescan_after)
         return Envelope(message="已创建刷新任务。", data=TaskResponse(task_id=task_id, task_status="queued"))
 
     @router.get("/auth/status", response_model=Envelope[AuthStatus])
@@ -125,7 +195,10 @@ def create_router(task_manager: TaskManager) -> APIRouter:
     async def create_download_tasks(payload: DownloadRequest) -> Envelope[TaskResponse]:
         if not payload.post_ids:
             raise HTTPException(status_code=400, detail="post_ids must not be empty")
-        task_ids = task_manager.enqueue_downloads(payload.post_ids)
+        try:
+            task_ids = task_manager.enqueue_downloads(payload.post_ids)
+        except MegaCommandConfigurationError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
         return Envelope(
             message=f"已创建 {len(task_ids)} 个下载任务。",
             data=TaskResponse(task_ids=task_ids, task_status="queued"),
@@ -135,6 +208,8 @@ def create_router(task_manager: TaskManager) -> APIRouter:
     async def retry_task(payload: RetryRequest) -> Envelope[TaskResponse]:
         try:
             task_id = task_manager.retry_task(payload.task_id)
+        except MegaCommandConfigurationError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
         except ValueError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         return Envelope(message="已重试任务。", data=TaskResponse(task_id=task_id, task_status="queued"))
@@ -151,6 +226,8 @@ def create_router(task_manager: TaskManager) -> APIRouter:
                 post_id=task.post_id,
                 message=task.message,
                 error=task.error,
+                download_failure_kind=task.download_failure_kind,
+                download_return_code=task.download_return_code,
                 log=task.log,
                 progress_current=task.progress_current,
                 progress_total=task.progress_total,
@@ -301,7 +378,7 @@ def create_router(task_manager: TaskManager) -> APIRouter:
     def purge_archives(payload: ArchivePurgeRequest, db: Session = Depends(get_db)) -> Envelope[ArchiveActionResult]:
         settings = db.get(Settings, 1)
         assert settings is not None
-        deleted_paths = purge_archive_files(settings.library_dir, payload.year)
+        deleted_paths = purge_archive_files(settings.download_dir, payload.year)
         if deleted_paths:
             artifacts = db.query(Artifact).all()
             deleted_set = set(deleted_paths)
@@ -312,7 +389,7 @@ def create_router(task_manager: TaskManager) -> APIRouter:
 
         target_label = f"{payload.year} 年" if payload.year else "所有年份"
         return Envelope(
-            message=f"已清理 {target_label} 的 Archive 压缩包。",
+            message=f"已清理 {target_label} 下载目录中的压缩包。",
             data=ArchiveActionResult(deleted_count=len(deleted_paths), deleted_paths=deleted_paths),
         )
 

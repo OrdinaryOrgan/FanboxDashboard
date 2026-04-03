@@ -7,6 +7,7 @@ from app.services.files import (
     open_in_explorer,
     purge_archive_files,
     reconcile_archive_path,
+    reconcile_extract_dir,
     rename_images,
 )
 
@@ -46,7 +47,7 @@ def test_rename_images_normalizes_duplicate_suffix_style(tmp_path: Path) -> None
     assert (target / "title04_1.jpg").exists()
 
 
-def test_build_post_storage_paths_uses_year_title_and_archive_dir() -> None:
+def test_build_post_storage_paths_uses_download_year_and_library_title_dirs() -> None:
     paths = build_post_storage_paths(
         library_root=r"D:\hmoe\Siu",
         download_root=r"C:\temp\downloads",
@@ -58,11 +59,11 @@ def test_build_post_storage_paths_uses_year_title_and_archive_dir() -> None:
     assert paths.year == "2026"
     assert paths.folder_name == "信濃③C"
     assert paths.extract_dir == r"D:\hmoe\Siu\2026\信濃③C"
-    assert paths.download_dir == r"D:\hmoe\Siu\2026\Archive"
+    assert paths.download_dir == r"C:\temp\downloads\2026"
 
 
 def test_delete_archive_file_removes_single_file(tmp_path: Path) -> None:
-    archive = tmp_path / "2026" / "Archive" / "sample.zip"
+    archive = tmp_path / "2026" / "sample.zip"
     archive.parent.mkdir(parents=True)
     archive.write_bytes(b"zip")
 
@@ -72,27 +73,61 @@ def test_delete_archive_file_removes_single_file(tmp_path: Path) -> None:
     assert not archive.exists()
 
 
-def test_reconcile_archive_path_moves_legacy_archive_into_year_archive(tmp_path: Path) -> None:
-    legacy_archive = tmp_path / "legacy" / "信濃③C.zip"
-    legacy_archive.parent.mkdir(parents=True)
-    legacy_archive.write_bytes(b"zip")
+def test_reconcile_archive_path_returns_existing_download_archive(tmp_path: Path) -> None:
+    download_root = tmp_path / "downloads"
+    archive = download_root / "2026" / "信濃③C.zip"
+    archive.parent.mkdir(parents=True)
+    archive.write_bytes(b"zip")
 
     reconciled = reconcile_archive_path(
-        current_archive_path=str(legacy_archive),
-        library_root=str(tmp_path),
+        current_archive_path=str(archive),
+        library_root=str(tmp_path / "library"),
+        download_root=str(download_root),
         title="信濃③",
         published_at=datetime(2026, 3, 22, 8, 0),
         fallback_name="11560240",
     )
 
-    expected = tmp_path / "2026" / "Archive" / "信濃③C.zip"
-    assert reconciled == str(expected)
-    assert expected.exists()
-    assert not legacy_archive.exists()
+    assert reconciled == str(archive.resolve())
+    assert archive.exists()
 
 
-def test_purge_archive_files_removes_year_archive_contents(tmp_path: Path) -> None:
-    archive_dir = tmp_path / "2026" / "Archive"
+def test_reconcile_archive_path_matches_unicode_normalized_archive_name(tmp_path: Path) -> None:
+    download_root = tmp_path / "downloads"
+    archive = download_root / "2026" / "大鳳xフリードリヒ・デア・グローセ①.zip"
+    archive.parent.mkdir(parents=True)
+    archive.write_bytes(b"zip")
+
+    reconciled = reconcile_archive_path(
+        current_archive_path=None,
+        library_root=str(tmp_path / "library"),
+        download_root=str(download_root),
+        title="大鳳xフリードリヒ・デア・グローセ①",
+        published_at=datetime(2026, 3, 31, 8, 0),
+        fallback_name="11649005",
+    )
+
+    assert reconciled == str(archive.resolve())
+
+
+def test_reconcile_extract_dir_matches_unicode_normalized_directory_name(tmp_path: Path) -> None:
+    extract_dir = tmp_path / "library" / "2026" / "大鳳xフリードリヒ・デア・グローセ①"
+    extract_dir.mkdir(parents=True)
+    (extract_dir / "sample.jpg").write_bytes(b"jpg")
+
+    reconciled = reconcile_extract_dir(
+        current_extract_dir=None,
+        library_root=str(tmp_path / "library"),
+        title="大鳳xフリードリヒ・デア・グローセ①",
+        published_at=datetime(2026, 3, 31, 8, 0),
+        fallback_name="11649005",
+    )
+
+    assert reconciled == str(extract_dir.resolve())
+
+
+def test_purge_archive_files_removes_year_download_contents(tmp_path: Path) -> None:
+    archive_dir = tmp_path / "2026"
     archive_dir.mkdir(parents=True)
     first = archive_dir / "a.zip"
     second = archive_dir / "b.zip"

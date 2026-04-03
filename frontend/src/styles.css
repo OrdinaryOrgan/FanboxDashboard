@@ -41,6 +41,9 @@
   --status-warning-button-fg: #8c5f22;
   --status-warning-button-border: rgba(140, 95, 34, 0.4);
   --status-warning-button-bg: rgba(246, 232, 212, 0.98);
+  --warning-panel-button-fg: #8f5f1c;
+  --warning-panel-button-border: rgba(178, 128, 65, 0.42);
+  --warning-panel-button-bg: rgba(249, 238, 220, 0.98);
   --status-danger-button-fg: #95463d;
   --status-danger-button-border: rgba(149, 70, 61, 0.4);
   --status-danger-button-bg: rgba(247, 228, 224, 0.98);
@@ -105,6 +108,9 @@
   --status-warning-button-fg: var(--warning);
   --status-warning-button-border: color-mix(in srgb, var(--warning) 28%, transparent);
   --status-warning-button-bg: color-mix(in srgb, var(--surface-raised) 88%, var(--warning-soft));
+  --warning-panel-button-fg: #e3bd8b;
+  --warning-panel-button-border: color-mix(in srgb, var(--warning) 24%, var(--surface-stroke));
+  --warning-panel-button-bg: color-mix(in srgb, var(--surface-raised) 72%, var(--warning-soft));
   --status-danger-button-fg: var(--danger);
   --status-danger-button-border: color-mix(in srgb, var(--danger) 24%, transparent);
   --status-danger-button-bg: color-mix(in srgb, var(--surface-raised) 88%, var(--danger-soft));
@@ -907,6 +913,52 @@ a {
   font-weight: 400;
 }
 
+.llm-settings-layout .llm-api-key-toggle {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  border: none;
+  background: transparent;
+  color: var(--app-text-faint);
+  cursor: pointer;
+  transition:
+    color 0.18s cubic-bezier(0.22, 1, 0.36, 1),
+    transform 0.12s cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+.llm-settings-layout .llm-api-key-input.is-masked .ant-input {
+  -webkit-text-security: disc;
+}
+
+.llm-settings-layout .llm-api-key-input.ant-input-affix-wrapper {
+  padding-block: 0 !important;
+  padding-top: 0 !important;
+  padding-bottom: 0 !important;
+}
+
+.llm-settings-layout .llm-api-key-input.ant-input-affix-wrapper > .ant-input {
+  height: 32px !important;
+  min-height: 32px !important;
+  padding-block: 4px !important;
+  padding-top: 4px !important;
+  padding-bottom: 4px !important;
+  box-sizing: border-box !important;
+}
+
+.llm-settings-layout .llm-api-key-toggle:hover {
+  color: var(--app-text-soft);
+}
+
+.llm-settings-layout .llm-api-key-toggle:active {
+  transform: scale(0.96);
+}
+
+.llm-settings-layout .llm-api-key-toggle:focus-visible {
+  outline: none;
+  color: var(--accent-strong);
+}
+
 .llm-settings-layout .settings-section-actions .ant-btn,
 .floating-panel-actions .floating-panel-button-group .ant-btn {
   font-size: 0.94rem;
@@ -1308,6 +1360,14 @@ a {
   opacity: 1 !important;
 }
 
+.post-actions .post-download-button.is-extract-ready.ant-btn,
+.post-actions .post-download-button.is-extract-ready.ant-btn:disabled {
+  color: var(--accent-strong) !important;
+  border-color: color-mix(in srgb, var(--accent) 26%, transparent) !important;
+  background: color-mix(in srgb, var(--accent-soft) 90%, var(--surface-raised)) !important;
+  opacity: 1 !important;
+}
+
 .post-actions .post-download-button.is-active.ant-btn,
 .post-actions .post-download-button.is-active.ant-btn:disabled {
   color: var(--status-warning-button-fg) !important;
@@ -1632,22 +1692,70 @@ a {
   justify-content: flex-end;
 }
 
-.archive-panel-title {
-  color: var(--app-text);
-  font-size: 1.2rem;
-  font-weight: 700;
-  line-height: 1.08;
+.creator-url-prompt-modal .ant-modal-header,
+.download-command-prompt-modal .ant-modal-header {
+  display: flex;
+  align-items: center;
+  min-height: 40px;
+  margin-bottom: 14px;
+  padding-right: 64px;
 }
 
-.archive-panel-description {
-  color: var(--app-text-soft) !important;
-  max-width: 52ch;
-  font-size: 0.94rem;
-  line-height: 1.55;
+.creator-url-prompt-modal .ant-modal-close,
+.download-command-prompt-modal .ant-modal-close {
+  top: 26px;
+  right: 20px;
+}
+
+.creator-url-prompt-layout,
+.download-command-prompt-layout {
+  display: grid;
+  gap: 20px;
+}
+
+.creator-url-prompt-hero,
+.download-command-prompt-hero {
+  display: grid;
+  gap: 12px;
+  align-items: start;
+}
+
+.creator-url-prompt-copy,
+.download-command-prompt-copy {
+  display: grid;
+  gap: 12px;
+  min-width: 0;
+  width: 100%;
+}
+
+.creator-url-prompt-copy .settings-section-kicker,
+.download-command-prompt-copy .settings-section-kicker {
+  letter-spacing: 0.12em;
+}
+
+.creator-url-prompt-heading.ant-typography,
+.download-command-prompt-heading.ant-typography {
+  margin: 0 !important;
+  color: var(--app-text);
+  font-size: 1.06rem;
+  font-weight: 600;
+  line-height: 1.38;
+  letter-spacing: -0.012em;
   text-wrap: pretty;
 }
 
-.archive-panel-description .ant-typography code {
+.creator-url-prompt-description.ant-typography,
+.download-command-prompt-description.ant-typography {
+  margin-bottom: 0 !important;
+  color: var(--app-text-soft);
+  font-size: 0.93rem;
+  line-height: 1.72;
+  font-weight: 400;
+  text-wrap: pretty;
+}
+
+.creator-url-prompt-description .ant-typography code,
+.download-command-prompt-description .ant-typography code {
   display: inline-flex;
   align-items: center;
   min-height: 28px;
@@ -1658,6 +1766,92 @@ a {
   color: var(--app-text) !important;
   font-size: 0.84rem;
   line-height: 1;
+}
+
+.download-command-prompt-meta {
+  display: grid;
+  gap: 8px;
+  width: 100%;
+}
+
+.download-command-prompt-label {
+  color: var(--app-text-faint) !important;
+  font-size: 0.8rem;
+  font-weight: 600;
+  line-height: 1.2;
+  letter-spacing: 0.03em;
+}
+
+.download-command-prompt-value {
+  width: 100%;
+  min-height: 36px;
+  padding: 10px 12px;
+  border-radius: 14px;
+  border: 1px solid var(--surface-stroke-soft);
+  background: color-mix(in srgb, var(--surface-muted) 82%, transparent);
+  color: var(--app-text);
+  font-family: "IBM Plex Mono", "SFMono-Regular", Consolas, monospace;
+  font-size: 0.83rem;
+  font-weight: 500;
+  line-height: 1.58;
+  letter-spacing: -0.01em;
+  white-space: normal;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+.creator-url-prompt-actions,
+.download-command-prompt-actions {
+  justify-content: flex-end;
+  margin-top: 0;
+}
+
+.archive-panel-copy {
+  display: grid;
+  gap: 12px;
+  width: 100%;
+}
+
+.archive-panel-description.ant-typography {
+  margin-bottom: 0 !important;
+  color: var(--app-text-soft);
+  max-width: 52ch;
+  font-size: 0.94rem;
+  font-weight: 400;
+  line-height: 1.68;
+  text-wrap: pretty;
+}
+
+.archive-path-meta {
+  display: grid;
+  gap: 8px;
+  width: 100%;
+}
+
+.archive-path-label {
+  color: var(--app-text-faint) !important;
+  font-size: 0.82rem;
+  font-weight: 600;
+  line-height: 1.2;
+  letter-spacing: 0.01em;
+}
+
+.archive-path-block {
+  width: 100%;
+  min-height: 36px;
+  padding: 10px 12px;
+  border-radius: 14px;
+  border: 1px solid var(--surface-stroke-soft);
+  background: color-mix(in srgb, var(--surface-muted) 82%, transparent);
+  color: var(--app-text);
+  font-family: "IBM Plex Mono", "SFMono-Regular", Consolas, monospace;
+  font-size: 0.83rem;
+  font-weight: 500;
+  line-height: 1.6;
+  letter-spacing: -0.01em;
+  white-space: normal;
+  overflow-wrap: anywhere;
+  word-break: break-word;
 }
 
 .archive-year-select {
@@ -2120,15 +2314,15 @@ body.is-resizing-task-drawer {
 }
 
 .focus-alert .focus-alert-button.ant-btn {
-  color: var(--status-warning-button-fg) !important;
-  border-color: var(--status-warning-button-border) !important;
-  background: var(--status-warning-button-bg) !important;
+  color: var(--warning-panel-button-fg) !important;
+  border-color: var(--warning-panel-button-border) !important;
+  background: var(--warning-panel-button-bg) !important;
 }
 
 .focus-alert .focus-alert-button.ant-btn:not(:disabled):hover {
-  color: var(--status-warning-button-fg) !important;
-  border-color: color-mix(in srgb, var(--warning) 48%, var(--status-warning-button-border)) !important;
-  background: color-mix(in srgb, var(--status-warning-button-bg) 82%, var(--warning-soft)) !important;
+  color: var(--warning-panel-button-fg) !important;
+  border-color: color-mix(in srgb, var(--warning) 52%, var(--warning-panel-button-border)) !important;
+  background: color-mix(in srgb, var(--warning-panel-button-bg) 84%, var(--warning-soft)) !important;
 }
 
 .title-alias-mode-group {

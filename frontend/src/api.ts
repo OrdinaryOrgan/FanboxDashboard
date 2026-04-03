@@ -46,10 +46,10 @@ async function request<T>(path: string, options?: RequestInit): Promise<T> {
 export const api = {
   health: () => request<{ status: string }>('/health'),
   getPosts: () => request<Post[]>('/api/posts'),
-  refreshPosts: (mode: RefreshMode = 'incremental') =>
+  refreshPosts: (mode: RefreshMode = 'incremental', autoRescanAfter = false) =>
     request<TaskResponse>('/api/posts/refresh', {
       method: 'POST',
-      body: JSON.stringify({ mode }),
+      body: JSON.stringify({ mode, auto_rescan_after: autoRescanAfter }),
     }),
   getTasks: () => request<Task[]>('/api/tasks'),
   clearTasks: () => request<TaskClearResult>('/api/tasks/clear', { method: 'POST' }),
