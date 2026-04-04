@@ -9,6 +9,7 @@ from app.services.fanbox import (
     _find_new_chromium_window,
     _launch_persistent_context_with_retry,
     inspect_auth_status,
+    logout_fanbox,
     open_login_window,
     _wait_for_login_completion,
 )
@@ -344,3 +345,21 @@ def test_profile_context_lock_serializes_same_profile(tmp_path: Path) -> None:
     asyncio.run(run_workers())
 
     assert events == ["first:enter", "first:exit", "second:enter", "second:exit"]
+
+
+def test_logout_fanbox_removes_profile_directory(tmp_path: Path) -> None:
+    profile_dir = tmp_path / "profile"
+    profile_dir.mkdir(parents=True, exist_ok=True)
+    (profile_dir / "storage_state.json").write_text("{}", encoding="utf-8")
+    (profile_dir / "Preferences").write_text("{}", encoding="utf-8")
+
+    settings = Settings(
+        creator_url="https://www.fanbox.cc/",
+        profile_dir=str(profile_dir),
+        playwright_channel="msedge",
+    )
+
+    message = asyncio.run(logout_fanbox(settings))
+
+    assert message == "Fanbox login state cleared."
+    assert profile_dir.exists() is False

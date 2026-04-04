@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import ctypes
 import re
+import shutil
 import threading
 from contextlib import asynccontextmanager
 from collections.abc import Awaitable, Callable, Mapping
@@ -96,6 +97,17 @@ async def inspect_auth_status(settings: Settings) -> tuple[bool, str | None]:
                 return False, reason or "Stored browser state is present, but Fanbox login could not be verified."
             finally:
                 await context.close()
+
+
+async def logout_fanbox(settings: Settings) -> str:
+    profile_dir = Path(settings.profile_dir)
+    async with _acquire_profile_context_lock(profile_dir):
+        if profile_dir.exists():
+            if profile_dir.is_dir():
+                shutil.rmtree(profile_dir)
+            else:
+                profile_dir.unlink()
+    return "Fanbox login state cleared."
 
 
 async def open_login_window(settings: Settings) -> str:

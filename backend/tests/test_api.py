@@ -227,6 +227,45 @@ def test_download_tasks_reject_invalid_mega_command(monkeypatch) -> None:
     assert response.json()["detail"] == "当前下载命令不可用，请先在设置中填写可用的 mega-get 可执行文件或目录。"
 
 
+def test_logout_endpoint_clears_profile_directory(tmp_path: Path) -> None:
+    profile_dir = tmp_path / "profile"
+    profile_dir.mkdir(parents=True, exist_ok=True)
+    (profile_dir / "storage_state.json").write_text("{}", encoding="utf-8")
+
+    with SessionLocal() as session:
+        settings = session.get(Settings, 1)
+        assert settings is not None
+        settings.profile_dir = str(profile_dir)
+        session.commit()
+
+    client = TestClient(app)
+    response = client.post("/api/auth/logout")
+
+    assert response.status_code == 200
+    assert response.json()["message"] == "已退出登录。"
+    assert response.json()["data"]["authenticated"] is False
+    assert response.json()["data"]["profile_exists"] is False
+    assert profile_dir.exists() is False
+
+
+def test_logout_endpoint_rejects_when_refresh_or_login_task_is_active() -> None:
+    with SessionLocal() as session:
+        session.add(
+            Task(
+                id="task-active-refresh",
+                kind=TaskKind.REFRESH_POSTS.value,
+                status=TaskStatus.RUNNING_REFRESH.value,
+            )
+        )
+        session.commit()
+
+    client = TestClient(app)
+    response = client.post("/api/auth/logout")
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == "当前仍有登录或刷新任务在运行，请等待任务结束后再退出登录。"
+
+
 def test_posts_expose_needs_title_annotation_flag() -> None:
     with SessionLocal() as session:
         session.add_all(

@@ -31,7 +31,7 @@ from app.schemas.settings import (
     TitleAnnotationCacheClearResult,
 )
 from app.schemas.task import RetryRequest, TaskClearResult, TaskRead
-from app.services.fanbox import inspect_auth_status
+from app.services.fanbox import inspect_auth_status, logout_fanbox
 from app.services.files import delete_archive_file, open_in_explorer, purge_archive_files, resolve_post_open_path
 from app.services.mega import MegaCommandConfigurationError, classify_mega_download_failure
 from app.services.tasks import TaskManager
@@ -190,6 +190,23 @@ def create_router(task_manager: TaskManager) -> APIRouter:
     async def open_login() -> Envelope[TaskResponse]:
         task_id = task_manager.enqueue_login()
         return Envelope(message="已创建登录任务。", data=TaskResponse(task_id=task_id, task_status="queued"))
+
+    @router.post("/auth/logout", response_model=Envelope[AuthStatus])
+    async def logout(db: Session = Depends(get_db)) -> Envelope[AuthStatus]:
+        if task_manager.has_active_auth_profile_task():
+            raise HTTPException(status_code=409, detail="当前仍有登录或刷新任务在运行，请等待任务结束后再退出登录。")
+
+        settings = db.get(Settings, 1)
+        assert settings is not None
+        await logout_fanbox(settings)
+        return Envelope(
+            message="已退出登录。",
+            data=AuthStatus(
+                authenticated=False,
+                profile_exists=False,
+                reason="Current Fanbox login state was cleared.",
+            ),
+        )
 
     @router.post("/tasks/download", response_model=Envelope[TaskResponse])
     async def create_download_tasks(payload: DownloadRequest) -> Envelope[TaskResponse]:

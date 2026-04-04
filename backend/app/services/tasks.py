@@ -115,6 +115,10 @@ class TaskManager:
         self._running_tasks[task_id] = asyncio.create_task(self._run_login(task_id))
         return task_id
 
+    def has_active_auth_profile_task(self) -> bool:
+        with SessionLocal() as session:
+            return self._find_active_auth_profile_task(session) is not None
+
     def enqueue_annotation(self) -> str:
         with SessionLocal() as session:
             active_task = self._find_active_annotation_task(session)
@@ -692,6 +696,23 @@ class TaskManager:
             .filter(
                 Task.kind == TaskKind.ANNOTATE_TITLES.value,
                 Task.status.in_([TaskStatus.QUEUED.value, TaskStatus.RUNNING_ANNOTATE.value]),
+            )
+            .order_by(Task.created_at.desc())
+            .first()
+        )
+
+    def _find_active_auth_profile_task(self, session: Session) -> Task | None:
+        return (
+            session.query(Task)
+            .filter(
+                Task.kind.in_([TaskKind.OPEN_LOGIN.value, TaskKind.REFRESH_POSTS.value]),
+                Task.status.in_(
+                    [
+                        TaskStatus.QUEUED.value,
+                        TaskStatus.RUNNING_LOGIN.value,
+                        TaskStatus.RUNNING_REFRESH.value,
+                    ]
+                ),
             )
             .order_by(Task.created_at.desc())
             .first()

@@ -61,6 +61,7 @@ export const api = {
     }),
   getAuthStatus: () => request<AuthStatus>('/api/auth/status'),
   openLogin: () => request<TaskResponse>('/api/auth/open-login', { method: 'POST' }),
+  logout: () => request<AuthStatus>('/api/auth/logout', { method: 'POST' }),
   rescanLibrary: () => request<TaskResponse>('/api/library/rescan', { method: 'POST' }),
   downloadPosts: (postIds: string[]) =>
     request<TaskResponse>('/api/tasks/download', {

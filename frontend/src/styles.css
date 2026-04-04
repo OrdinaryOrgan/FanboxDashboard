@@ -320,6 +320,26 @@ a {
   color: var(--app-text-soft);
 }
 
+.topbar-menu-overlay .ant-dropdown-menu-item-danger,
+.topbar-menu-overlay .ant-dropdown-menu-item-danger:hover,
+.topbar-menu-overlay .ant-dropdown-menu-item-danger:active {
+  color: var(--status-danger-button-fg) !important;
+}
+
+.topbar-menu-overlay .ant-dropdown-menu-item-danger .ant-dropdown-menu-item-icon,
+.topbar-menu-overlay .ant-dropdown-menu-item-danger:hover .ant-dropdown-menu-item-icon,
+.topbar-menu-overlay .ant-dropdown-menu-item-danger:active .ant-dropdown-menu-item-icon {
+  color: var(--status-danger-button-fg) !important;
+}
+
+.topbar-menu-overlay .ant-dropdown-menu-item-danger:hover {
+  background: color-mix(in srgb, var(--status-danger-button-bg) 82%, transparent) !important;
+}
+
+.topbar-menu-overlay .ant-dropdown-menu-item-danger:active {
+  background: color-mix(in srgb, var(--status-danger-button-bg) 92%, transparent) !important;
+}
+
 .post-actions-menu-overlay {
   padding-top: 8px;
 }
@@ -1693,7 +1713,8 @@ a {
 }
 
 .creator-url-prompt-modal .ant-modal-header,
-.download-command-prompt-modal .ant-modal-header {
+.download-command-prompt-modal .ant-modal-header,
+.logout-prompt-modal .ant-modal-header {
   display: flex;
   align-items: center;
   min-height: 40px;
@@ -1702,26 +1723,30 @@ a {
 }
 
 .creator-url-prompt-modal .ant-modal-close,
-.download-command-prompt-modal .ant-modal-close {
+.download-command-prompt-modal .ant-modal-close,
+.logout-prompt-modal .ant-modal-close {
   top: 26px;
   right: 20px;
 }
 
 .creator-url-prompt-layout,
-.download-command-prompt-layout {
+.download-command-prompt-layout,
+.logout-prompt-layout {
   display: grid;
   gap: 20px;
 }
 
 .creator-url-prompt-hero,
-.download-command-prompt-hero {
+.download-command-prompt-hero,
+.logout-prompt-hero {
   display: grid;
   gap: 12px;
   align-items: start;
 }
 
 .creator-url-prompt-copy,
-.download-command-prompt-copy {
+.download-command-prompt-copy,
+.logout-prompt-copy {
   display: grid;
   gap: 12px;
   min-width: 0;
@@ -1729,12 +1754,14 @@ a {
 }
 
 .creator-url-prompt-copy .settings-section-kicker,
-.download-command-prompt-copy .settings-section-kicker {
+.download-command-prompt-copy .settings-section-kicker,
+.logout-prompt-copy .settings-section-kicker {
   letter-spacing: 0.12em;
 }
 
 .creator-url-prompt-heading.ant-typography,
-.download-command-prompt-heading.ant-typography {
+.download-command-prompt-heading.ant-typography,
+.logout-prompt-heading.ant-typography {
   margin: 0 !important;
   color: var(--app-text);
   font-size: 1.06rem;
@@ -1745,13 +1772,43 @@ a {
 }
 
 .creator-url-prompt-description.ant-typography,
-.download-command-prompt-description.ant-typography {
+.download-command-prompt-description.ant-typography,
+.logout-prompt-description.ant-typography {
   margin-bottom: 0 !important;
   color: var(--app-text-soft);
   font-size: 0.93rem;
   line-height: 1.72;
   font-weight: 400;
   text-wrap: pretty;
+}
+
+.logout-prompt-layout {
+  gap: 18px;
+}
+
+.logout-prompt-hero {
+  gap: 10px;
+}
+
+.logout-prompt-copy {
+  gap: 10px;
+}
+
+.logout-prompt-heading.ant-typography {
+  font-size: 1.02rem;
+  font-weight: 620;
+  line-height: 1.34;
+  letter-spacing: -0.01em;
+}
+
+.logout-prompt-description.ant-typography {
+  color: color-mix(in srgb, var(--app-text-soft) 88%, var(--app-text-faint));
+  font-size: 0.92rem;
+  line-height: 1.68;
+}
+
+.logout-prompt-actions .floating-panel-button-group {
+  margin-left: auto;
 }
 
 .creator-url-prompt-description .ant-typography code,
@@ -1801,10 +1858,11 @@ a {
 }
 
 .creator-url-prompt-actions,
-.download-command-prompt-actions {
-  justify-content: flex-end;
-  margin-top: 0;
-}
+.download-command-prompt-actions,
+.logout-prompt-actions {
+    justify-content: flex-end;
+    margin-top: 0;
+  }
 
 .archive-panel-copy {
   display: grid;
@@ -1820,6 +1878,11 @@ a {
   font-weight: 400;
   line-height: 1.68;
   text-wrap: pretty;
+}
+
+.archive-panel-description--intro.ant-typography {
+  max-width: 100%;
+  text-wrap: wrap;
 }
 
 .archive-path-meta {

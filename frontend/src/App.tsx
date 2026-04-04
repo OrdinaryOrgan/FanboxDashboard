@@ -39,6 +39,7 @@ import {
   InboxOutlined,
   LeftOutlined,
   LoginOutlined,
+  LogoutOutlined,
   MoonOutlined,
   ReloadOutlined,
   RobotOutlined,
@@ -119,6 +120,7 @@ const AUTH_FAST_POLL_INTERVAL_MS = 3_000
 const AUTH_DEFAULT_POLL_INTERVAL_MS = 45_000
 const AUTH_FAST_POLL_WINDOW_MS = 180_000
 const DEFAULT_CREATOR_URL = 'https://www.fanbox.cc/'
+const FANBOX_HOME_URL = 'https://www.fanbox.cc'
 const HAS_TIMEZONE_SUFFIX = /([zZ]|[+-]\d{2}:\d{2})$/
 const MIN_TASK_DRAWER_WIDTH = 560
 const MAX_TASK_DRAWER_WIDTH = 1080
@@ -753,6 +755,7 @@ export default function App({
   const [llmApiKeyVisible, setLlmApiKeyVisible] = useState(false)
   const [titleAliasModalPost, setTitleAliasModalPost] = useState<Post | null>(null)
   const [tasksOpen, setTasksOpen] = useState(false)
+  const [logoutPromptOpen, setLogoutPromptOpen] = useState(false)
   const [purgeYear, setPurgeYear] = useState<string>()
   const [selectedYear, setSelectedYear] = useState<string>()
   const [frontYear, setFrontYear] = useState<string>()
@@ -899,6 +902,22 @@ export default function App({
         queryClient.invalidateQueries({ queryKey: ['auth-status'] }),
         queryClient.invalidateQueries({ queryKey: ['tasks'] }),
       ])
+    },
+  })
+
+  const logoutMutation = useMutation({
+    mutationFn: api.logout,
+    onSuccess: async () => {
+      setLogoutPromptOpen(false)
+      setAuthFastPollingUntil(null)
+      message.success('已退出登录')
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ['auth-status'] }),
+        queryClient.invalidateQueries({ queryKey: ['tasks'] }),
+      ])
+    },
+    onError: (error) => {
+      message.error(error instanceof Error ? error.message : '退出登录失败')
     },
   })
 
@@ -1544,7 +1563,14 @@ export default function App({
     { key: 'llm', label: '标题补注', icon: <RobotOutlined /> },
     { key: 'tasks', label: '任务队列', icon: <UnorderedListOutlined /> },
     { type: 'divider' },
-    { key: 'login', label: '打开登录窗口', icon: <LoginOutlined /> },
+    {
+      key: 'auth-action',
+      label: authQuery.data?.authenticated ? '打开 Fanbox 首页' : '打开登录窗口',
+      icon: <LoginOutlined />,
+    },
+    ...(authQuery.data?.authenticated
+      ? [{ key: 'logout', label: '退出登录', icon: <LogoutOutlined />, danger: true }]
+      : []),
   ]
 
   const handleMenuClick: MenuProps['onClick'] = ({ key }) => {
@@ -1552,7 +1578,14 @@ export default function App({
     if (key === 'archive') setPanel('archive')
     if (key === 'llm') setPanel('llm')
     if (key === 'tasks') setTasksOpen(true)
-    if (key === 'login') loginMutation.mutate()
+    if (key === 'auth-action') {
+      if (authQuery.data?.authenticated) {
+        handleOpenFanboxHome()
+      } else {
+        loginMutation.mutate()
+      }
+    }
+    if (key === 'logout') setLogoutPromptOpen(true)
   }
 
   const handleBulkDownload = () => {
@@ -1788,6 +1821,15 @@ export default function App({
 
   const handleCloseDownloadCommandPrompt = () => {
     setDownloadCommandPromptOpen(false)
+  }
+
+  const handleOpenFanboxHome = () => {
+    window.open(FANBOX_HOME_URL, '_blank', 'noopener,noreferrer')
+  }
+
+  const handleCloseLogoutPrompt = () => {
+    if (logoutMutation.isPending) return
+    setLogoutPromptOpen(false)
   }
 
   const themeButtonTitle = followSystemTheme
@@ -2377,6 +2419,48 @@ export default function App({
 
       <Modal
         centered
+        open={logoutPromptOpen}
+        onCancel={handleCloseLogoutPrompt}
+        footer={null}
+        width={560}
+        className="floating-panel-modal logout-prompt-modal"
+        transitionName="floating-panel-motion"
+        maskTransitionName="floating-panel-mask-motion"
+        closable={!logoutMutation.isPending}
+        title={
+          <div className="floating-panel-title">
+            <span className="floating-panel-title-text">退出登录</span>
+          </div>
+        }
+        >
+          <div className="logout-prompt-layout">
+            <div className="logout-prompt-hero">
+              <div className="logout-prompt-copy">
+                <Title level={4} className="logout-prompt-heading">
+                  退出当前 Fanbox 登录
+                </Title>
+                <Paragraph className="logout-prompt-description">
+                  会清除当前的 Fanbox 登录状态。已同步帖子、下载文件、词库和设置都会保留。
+                </Paragraph>
+              </div>
+            </div>
+          <div className="floating-panel-actions logout-prompt-actions">
+            <div className="floating-panel-button-group">
+              <Button
+                className="archive-danger-button"
+                danger
+                loading={logoutMutation.isPending}
+                onClick={() => logoutMutation.mutate()}
+              >
+                确认退出
+              </Button>
+            </div>
+          </div>
+        </div>
+      </Modal>
+
+      <Modal
+        centered
         open={panel === 'settings'}
         onCancel={() => setPanel(null)}
         footer={null}
@@ -2477,9 +2561,6 @@ export default function App({
               {authQuery.data?.authenticated ? '已登录' : '未登录'}
             </Tag>
             <div className="floating-panel-button-group">
-              <Button loading={loginMutation.isPending} onClick={() => loginMutation.mutate()}>
-                打开登录窗口
-              </Button>
               <Button loading={isImportingSettings} onClick={handleImportSettingsClick}>
                 导入设置
               </Button>
@@ -2511,7 +2592,7 @@ export default function App({
       >
         <Space direction="vertical" size={18} style={{ width: '100%' }}>
           <div className="archive-panel-copy">
-            <Paragraph className="archive-panel-description">
+            <Paragraph className="archive-panel-description archive-panel-description--intro">
               按年份清理下载目录中的压缩包，已整理到图库中的图片不会受影响。
             </Paragraph>
             <div className="archive-path-meta">
