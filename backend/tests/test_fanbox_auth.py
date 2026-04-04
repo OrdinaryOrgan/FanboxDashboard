@@ -5,7 +5,9 @@ from app.db.models import Settings
 from app.services.fanbox import (
     LOGIN_PAGE_URL,
     FanboxAuthError,
+    _acquire_profile_context_lock,
     _find_new_chromium_window,
+    _launch_persistent_context_with_retry,
     inspect_auth_status,
     open_login_window,
     _wait_for_login_completion,
@@ -273,3 +275,72 @@ def test_probe_fanbox_login_state_uses_background_request(monkeypatch) -> None:
         (AUTH_CHECK_URL, AUTH_CHECK_TIMEOUT_MS, False),
         (AUTH_CHECK_URL, AUTH_CHECK_TIMEOUT_MS, False),
     ]
+
+
+class _RetryableLaunchError(RuntimeError):
+    pass
+
+
+class _FakeRetryChromium:
+    def __init__(self, responses: list[object]) -> None:
+        self._responses = responses
+        self.calls: list[dict[str, object]] = []
+
+    async def launch_persistent_context(self, **kwargs):
+        self.calls.append(kwargs)
+        result = self._responses.pop(0)
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+
+class _FakeRetryPlaywright:
+    def __init__(self, chromium: _FakeRetryChromium) -> None:
+        self.chromium = chromium
+
+
+def test_launch_persistent_context_with_retry_retries_closed_browser(monkeypatch, tmp_path: Path) -> None:
+    chromium = _FakeRetryChromium(
+        [
+            _RetryableLaunchError("BrowserType.launch_persistent_context: Target page, context or browser has been closed"),
+            object(),
+        ]
+    )
+    playwright = _FakeRetryPlaywright(chromium)
+    sleep_calls: list[float] = []
+
+    async def fake_sleep(delay: float) -> None:
+        sleep_calls.append(delay)
+
+    monkeypatch.setattr("app.services.fanbox.asyncio.sleep", fake_sleep)
+
+    context = asyncio.run(
+        _launch_persistent_context_with_retry(
+            playwright,
+            profile_dir=tmp_path / "profile",
+            channel="msedge",
+            headless=True,
+        )
+    )
+
+    assert context is not None
+    assert len(chromium.calls) == 2
+    assert sleep_calls == [0.35]
+
+
+def test_profile_context_lock_serializes_same_profile(tmp_path: Path) -> None:
+    events: list[str] = []
+    profile_dir = tmp_path / "profile"
+
+    async def worker(name: str, delay: float) -> None:
+        async with _acquire_profile_context_lock(profile_dir):
+            events.append(f"{name}:enter")
+            await asyncio.sleep(delay)
+            events.append(f"{name}:exit")
+
+    async def run_workers() -> None:
+        await asyncio.gather(worker("first", 0.01), worker("second", 0.0))
+
+    asyncio.run(run_workers())
+
+    assert events == ["first:enter", "first:exit", "second:enter", "second:exit"]

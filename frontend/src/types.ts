@@ -69,6 +69,31 @@ export type Settings = {
   title_aliases_path: string
 }
 
+export type ExportableSettings = Pick<
+  Settings,
+  | 'creator_url'
+  | 'profile_dir'
+  | 'download_dir'
+  | 'library_dir'
+  | 'temp_dir'
+  | 'mega_command'
+  | 'playwright_channel'
+  | 'refresh_interval_minutes'
+  | 'download_concurrency'
+  | 'posts_per_row'
+  | 'auto_delete_archive'
+>
+
+export type SettingsTransferFile = {
+  schema_version: 1
+  app: 'fanbox-dashboard'
+  exported_at: string
+  settings: ExportableSettings
+  ui_preferences: {
+    follow_system_theme: boolean
+  }
+}
+
 export type AuthStatus = {
   authenticated: boolean
   profile_exists: boolean

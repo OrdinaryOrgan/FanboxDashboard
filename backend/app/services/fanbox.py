@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 import ctypes
 import re
+import threading
+from contextlib import asynccontextmanager
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from datetime import datetime
@@ -20,7 +22,10 @@ DEFAULT_CREATOR_URL = str(default_setting_value("creator_url"))
 LOGIN_PAGE_URL = "https://www.fanbox.cc/login"
 AUTH_CHECK_URL = "https://www.fanbox.cc/notifications"
 AUTH_CHECK_TIMEOUT_MS = 20000
+PERSISTENT_CONTEXT_LAUNCH_RETRY_DELAYS_SECONDS = (0.35, 0.9, 1.8)
 CHROMIUM_WINDOW_CLASSES = {"Chrome_WidgetWin_0", "Chrome_WidgetWin_1"}
+_PROFILE_CONTEXT_LOCKS: dict[str, asyncio.Lock] = {}
+_PROFILE_CONTEXT_LOCKS_GUARD = threading.Lock()
 
 
 class FanboxAuthError(RuntimeError):
@@ -76,19 +81,21 @@ async def inspect_auth_status(settings: Settings) -> tuple[bool, str | None]:
         return False, "No exported storage state found. Please re-open the login window once."
 
     async_playwright = await _get_async_playwright()
-    async with async_playwright() as playwright:
-        context = await playwright.chromium.launch_persistent_context(
-            user_data_dir=str(profile_dir),
-            channel=settings.playwright_channel,
-            headless=True,
-        )
-        try:
-            authenticated, reason = await _probe_fanbox_login_state(context)
-            if authenticated:
-                return True, "Persistent profile, exported state, and Fanbox login are valid."
-            return False, reason or "Stored browser state is present, but Fanbox login could not be verified."
-        finally:
-            await context.close()
+    async with _acquire_profile_context_lock(profile_dir):
+        async with async_playwright() as playwright:
+            context = await _launch_persistent_context_with_retry(
+                playwright,
+                profile_dir=profile_dir,
+                channel=settings.playwright_channel,
+                headless=True,
+            )
+            try:
+                authenticated, reason = await _probe_fanbox_login_state(context)
+                if authenticated:
+                    return True, "Persistent profile, exported state, and Fanbox login are valid."
+                return False, reason or "Stored browser state is present, but Fanbox login could not be verified."
+            finally:
+                await context.close()
 
 
 async def open_login_window(settings: Settings) -> str:
@@ -107,17 +114,18 @@ async def open_login_window(settings: Settings) -> str:
         launch_options["no_viewport"] = True
         existing_window_handles = _snapshot_chromium_window_handles()
 
-    async with async_playwright() as playwright:
-        context = await playwright.chromium.launch_persistent_context(**launch_options)
-        try:
-            page = context.pages[0] if context.pages else await context.new_page()
-            await _focus_new_chromium_window(page, existing_window_handles)
-            await page.goto(LOGIN_PAGE_URL, wait_until="domcontentloaded")
-            await _wait_for_login_completion(context, page, timeout_seconds=LOGIN_WINDOW_TIMEOUT_SECONDS)
-            await page.wait_for_timeout(800)
-            await context.storage_state(path=str(_storage_state_path(settings)))
-        finally:
-            await context.close()
+    async with _acquire_profile_context_lock(profile_dir):
+        async with async_playwright() as playwright:
+            context = await _launch_persistent_context_with_retry(playwright, **launch_options)
+            try:
+                page = context.pages[0] if context.pages else await context.new_page()
+                await _focus_new_chromium_window(page, existing_window_handles)
+                await page.goto(LOGIN_PAGE_URL, wait_until="domcontentloaded")
+                await _wait_for_login_completion(context, page, timeout_seconds=LOGIN_WINDOW_TIMEOUT_SECONDS)
+                await page.wait_for_timeout(800)
+                await context.storage_state(path=str(_storage_state_path(settings)))
+            finally:
+                await context.close()
     return "Login completed and exported persistent state."
 
 
@@ -135,54 +143,56 @@ async def refresh_posts(
     _validate_creator_url_for_refresh(creator_url)
 
     async_playwright = await _get_async_playwright()
-    async with async_playwright() as playwright:
-        context = await playwright.chromium.launch_persistent_context(
-            user_data_dir=str(profile_dir),
-            channel=settings.playwright_channel,
-            headless=True,
-        )
-        try:
-            authenticated, reason = await _probe_fanbox_login_state(context)
-            if not authenticated:
-                raise FanboxAuthError(reason or "Current auth state could not be verified.")
+    async with _acquire_profile_context_lock(profile_dir):
+        async with async_playwright() as playwright:
+            context = await _launch_persistent_context_with_retry(
+                playwright,
+                profile_dir=profile_dir,
+                channel=settings.playwright_channel,
+                headless=True,
+            )
+            try:
+                authenticated, reason = await _probe_fanbox_login_state(context)
+                if not authenticated:
+                    raise FanboxAuthError(reason or "Current auth state could not be verified.")
 
-            page = context.pages[0] if context.pages else await context.new_page()
-            await page.goto(creator_url, wait_until="domcontentloaded", timeout=20000)
-            await page.wait_for_timeout(1500)
-            paginate_urls = await _fetch_paginated_api_urls(context, creator_url)
-            if not paginate_urls:
-                raise FanboxConfigurationError("当前 Fanbox 页面地址无法读取帖子分页信息，请确认填写的是创作者主页。")
+                page = context.pages[0] if context.pages else await context.new_page()
+                await page.goto(creator_url, wait_until="domcontentloaded", timeout=20000)
+                await page.wait_for_timeout(1500)
+                paginate_urls = await _fetch_paginated_api_urls(context, creator_url)
+                if not paginate_urls:
+                    raise FanboxConfigurationError("当前 Fanbox 页面地址无法读取帖子分页信息，请确认填写的是创作者主页。")
 
-            async def fetch_api_page(_, creator_url: str, page_number: int) -> tuple[list[ScrapedPost], int | None]:
-                if page_number < 1 or page_number > len(paginate_urls):
-                    return [], len(paginate_urls)
-                posts = await _fetch_posts_from_api_url(context, creator_url, paginate_urls[page_number - 1])
-                return posts, len(paginate_urls)
+                async def fetch_api_page(_, creator_url: str, page_number: int) -> tuple[list[ScrapedPost], int | None]:
+                    if page_number < 1 or page_number > len(paginate_urls):
+                        return [], len(paginate_urls)
+                    posts = await _fetch_posts_from_api_url(context, creator_url, paginate_urls[page_number - 1])
+                    return posts, len(paginate_urls)
 
-            if mode == RefreshMode.INCREMENTAL:
-                posts = await _collect_posts_incremental(
-                    context,
-                    creator_url,
-                    existing_posts=existing_posts or {},
-                    limit=limit,
-                    progress_callback=progress_callback,
-                    fetch_page_fn=fetch_api_page,
-                )
-            else:
-                posts = await _collect_posts_full(
-                    context,
-                    creator_url,
-                    limit=limit,
-                    concurrency=PAGE_FETCH_CONCURRENCY,
-                    progress_callback=progress_callback,
-                    fetch_page_fn=fetch_api_page,
-                )
-            if posts:
-                return posts
-            raise FanboxConfigurationError("当前 Fanbox 页面地址没有解析到帖子内容，请检查是否填写了正确的创作者主页。")
-        finally:
-            await context.storage_state(path=str(_storage_state_path(settings)))
-            await context.close()
+                if mode == RefreshMode.INCREMENTAL:
+                    posts = await _collect_posts_incremental(
+                        context,
+                        creator_url,
+                        existing_posts=existing_posts or {},
+                        limit=limit,
+                        progress_callback=progress_callback,
+                        fetch_page_fn=fetch_api_page,
+                    )
+                else:
+                    posts = await _collect_posts_full(
+                        context,
+                        creator_url,
+                        limit=limit,
+                        concurrency=PAGE_FETCH_CONCURRENCY,
+                        progress_callback=progress_callback,
+                        fetch_page_fn=fetch_api_page,
+                    )
+                if posts:
+                    return posts
+                raise FanboxConfigurationError("当前 Fanbox 页面地址没有解析到帖子内容，请检查是否填写了正确的创作者主页。")
+            finally:
+                await context.storage_state(path=str(_storage_state_path(settings)))
+                await context.close()
 
 
 async def export_storage_state(settings: Settings) -> str:
@@ -190,19 +200,21 @@ async def export_storage_state(settings: Settings) -> str:
     profile_dir = Path(settings.profile_dir)
     profile_dir.mkdir(parents=True, exist_ok=True)
 
-    async with async_playwright() as playwright:
-        context = await playwright.chromium.launch_persistent_context(
-            user_data_dir=str(profile_dir),
-            channel=settings.playwright_channel,
-            headless=False,
-        )
-        try:
-            page = context.pages[0] if context.pages else await context.new_page()
-            await page.goto(LOGIN_PAGE_URL, wait_until="domcontentloaded", timeout=20000)
-            await page.wait_for_timeout(3000)
-            await context.storage_state(path=str(_storage_state_path(settings)))
-        finally:
-            await context.close()
+    async with _acquire_profile_context_lock(profile_dir):
+        async with async_playwright() as playwright:
+            context = await _launch_persistent_context_with_retry(
+                playwright,
+                profile_dir=profile_dir,
+                channel=settings.playwright_channel,
+                headless=False,
+            )
+            try:
+                page = context.pages[0] if context.pages else await context.new_page()
+                await page.goto(LOGIN_PAGE_URL, wait_until="domcontentloaded", timeout=20000)
+                await page.wait_for_timeout(3000)
+                await context.storage_state(path=str(_storage_state_path(settings)))
+            finally:
+                await context.close()
     return str(_storage_state_path(settings))
 
 
@@ -960,3 +972,56 @@ async def _get_async_playwright():
             "Playwright is not installed. Run `python -m pip install -r backend/requirements.txt` and `python -m playwright install chromium`."
         ) from exc
     return async_playwright
+
+
+@asynccontextmanager
+async def _acquire_profile_context_lock(profile_dir: Path):
+    lock = _profile_context_lock_for(profile_dir)
+    async with lock:
+        yield
+
+
+def _profile_context_lock_for(profile_dir: Path) -> asyncio.Lock:
+    key = str(profile_dir.resolve()).lower()
+    with _PROFILE_CONTEXT_LOCKS_GUARD:
+        lock = _PROFILE_CONTEXT_LOCKS.get(key)
+        if lock is None:
+            lock = asyncio.Lock()
+            _PROFILE_CONTEXT_LOCKS[key] = lock
+        return lock
+
+
+async def _launch_persistent_context_with_retry(
+    playwright,
+    *,
+    profile_dir: Path | None = None,
+    channel: str,
+    headless: bool,
+    **extra_launch_options,
+):
+    launch_options = {
+        "channel": channel,
+        "headless": headless,
+        **extra_launch_options,
+    }
+    if profile_dir is not None:
+        launch_options["user_data_dir"] = str(profile_dir)
+
+    for attempt, retry_delay in enumerate((0.0, *PERSISTENT_CONTEXT_LAUNCH_RETRY_DELAYS_SECONDS), start=1):
+        if retry_delay > 0:
+            await asyncio.sleep(retry_delay)
+        try:
+            return await playwright.chromium.launch_persistent_context(**launch_options)
+        except Exception as exc:
+            if attempt > len(PERSISTENT_CONTEXT_LAUNCH_RETRY_DELAYS_SECONDS) or not _is_retryable_persistent_context_error(exc):
+                raise
+
+
+def _is_retryable_persistent_context_error(exc: Exception) -> bool:
+    message = str(exc).lower()
+    return "launch_persistent_context" in message and (
+        "target page, context or browser has been closed" in message
+        or "browser has been closed" in message
+        or "user data directory is already in use" in message
+        or "profile appears to be in use" in message
+    )

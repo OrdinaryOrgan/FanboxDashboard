@@ -1,5 +1,5 @@
 import { startTransition, useEffect, useMemo, useRef, useState } from 'react'
-import type { CSSProperties, MouseEvent as ReactMouseEvent } from 'react'
+import type { ChangeEvent as ReactChangeEvent, CSSProperties, MouseEvent as ReactMouseEvent } from 'react'
 import {
   Alert,
   App as AntdApp,
@@ -56,10 +56,12 @@ import utc from 'dayjs/plugin/utc'
 import { api } from './api'
 import type {
   DownloadFailureKind,
+  ExportableSettings,
   Post,
   PostPrimaryAction,
   RefreshMode,
   Settings,
+  SettingsTransferFile,
   Task,
   TitleAliasUpsertRequest,
 } from './types'
@@ -145,6 +147,146 @@ const DOWNLOAD_TASK_CARD_OVERRIDE_STATUSES = new Set([
   'failed_rename',
 ])
 const FAILED_INVENTORY_STATUSES = new Set(['failed_parse', 'auth_expired'])
+const SETTINGS_TRANSFER_SCHEMA_VERSION = 1 as const
+const SETTINGS_TRANSFER_APP = 'fanbox-dashboard' as const
+
+const EXPORTABLE_SETTINGS_FIELDS: Array<keyof ExportableSettings> = [
+  'creator_url',
+  'profile_dir',
+  'download_dir',
+  'library_dir',
+  'temp_dir',
+  'mega_command',
+  'playwright_channel',
+  'refresh_interval_minutes',
+  'download_concurrency',
+  'posts_per_row',
+  'auto_delete_archive',
+]
+
+const SETTINGS_EXPORT_FORM_FIELDS: Array<keyof SettingsFormValues> = [
+  ...EXPORTABLE_SETTINGS_FIELDS,
+  'follow_system_theme',
+]
+
+const isRecord = (value: unknown): value is Record<string, unknown> => typeof value === 'object' && value !== null
+
+const readRequiredString = (record: Record<string, unknown>, fieldName: string) => {
+  const value = record[fieldName]
+  if (typeof value !== 'string' || value.trim().length === 0) {
+    throw new Error(`导入文件缺少有效字段：${fieldName}`)
+  }
+  return value
+}
+
+const readRangedInteger = (record: Record<string, unknown>, fieldName: string, min: number, max: number) => {
+  const value = record[fieldName]
+  if (typeof value !== 'number' || !Number.isInteger(value) || value < min || value > max) {
+    throw new Error(`导入文件中的 ${fieldName} 超出允许范围`)
+  }
+  return value
+}
+
+const readBoolean = (record: Record<string, unknown>, fieldName: string) => {
+  const value = record[fieldName]
+  if (typeof value !== 'boolean') {
+    throw new Error(`导入文件缺少有效字段：${fieldName}`)
+  }
+  return value
+}
+
+function buildExportableSettings(source: Settings | ExportableSettings): ExportableSettings {
+  return {
+    creator_url: source.creator_url,
+    profile_dir: source.profile_dir,
+    download_dir: source.download_dir,
+    library_dir: source.library_dir,
+    temp_dir: source.temp_dir,
+    mega_command: source.mega_command,
+    playwright_channel: source.playwright_channel,
+    refresh_interval_minutes: source.refresh_interval_minutes,
+    download_concurrency: source.download_concurrency,
+    posts_per_row: source.posts_per_row,
+    auto_delete_archive: source.auto_delete_archive,
+  }
+}
+
+function buildSettingsTransferFile(
+  settings: Settings | ExportableSettings,
+  followSystemTheme: boolean,
+): SettingsTransferFile {
+  return {
+    schema_version: SETTINGS_TRANSFER_SCHEMA_VERSION,
+    app: SETTINGS_TRANSFER_APP,
+    exported_at: new Date().toISOString(),
+    settings: buildExportableSettings(settings),
+    ui_preferences: {
+      follow_system_theme: followSystemTheme,
+    },
+  }
+}
+
+function parseSettingsTransferFile(raw: string) {
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(raw)
+  } catch {
+    throw new Error('设置文件不是有效的 JSON')
+  }
+
+  if (!isRecord(parsed)) {
+    throw new Error('设置文件结构无效')
+  }
+  if (parsed.schema_version !== SETTINGS_TRANSFER_SCHEMA_VERSION) {
+    throw new Error('设置文件版本不受支持')
+  }
+  if (parsed.app !== SETTINGS_TRANSFER_APP) {
+    throw new Error('设置文件不属于当前应用')
+  }
+  if (!isRecord(parsed.settings)) {
+    throw new Error('设置文件缺少 settings 对象')
+  }
+  if (!isRecord(parsed.ui_preferences)) {
+    throw new Error('设置文件缺少 ui_preferences 对象')
+  }
+
+  return {
+    settings: {
+      creator_url: readRequiredString(parsed.settings, 'creator_url'),
+      profile_dir: readRequiredString(parsed.settings, 'profile_dir'),
+      download_dir: readRequiredString(parsed.settings, 'download_dir'),
+      library_dir: readRequiredString(parsed.settings, 'library_dir'),
+      temp_dir: readRequiredString(parsed.settings, 'temp_dir'),
+      mega_command: readRequiredString(parsed.settings, 'mega_command'),
+      playwright_channel: readRequiredString(parsed.settings, 'playwright_channel'),
+      refresh_interval_minutes: readRangedInteger(parsed.settings, 'refresh_interval_minutes', 0, 1440),
+      download_concurrency: readRangedInteger(parsed.settings, 'download_concurrency', 1, 8),
+      posts_per_row: readRangedInteger(parsed.settings, 'posts_per_row', 3, 6),
+      auto_delete_archive: readBoolean(parsed.settings, 'auto_delete_archive'),
+    } satisfies ExportableSettings,
+    followSystemTheme: readBoolean(parsed.ui_preferences, 'follow_system_theme'),
+  }
+}
+
+function buildSettingsExportFileName() {
+  const now = new Date()
+  const pad = (value: number) => String(value).padStart(2, '0')
+  const timestamp = `${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}-${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}`
+  return `fanbox-dashboard-settings-${timestamp}.json`
+}
+
+function downloadSettingsTransferFile(file: SettingsTransferFile) {
+  const blob = new Blob([JSON.stringify(file, null, 2)], { type: 'application/json;charset=utf-8' })
+  const downloadUrl = window.URL.createObjectURL(blob)
+  const anchor = document.createElement('a')
+  anchor.href = downloadUrl
+  anchor.download = buildSettingsExportFileName()
+  document.body.appendChild(anchor)
+  anchor.click()
+  anchor.remove()
+  window.URL.revokeObjectURL(downloadUrl)
+}
+
 const toLocalTime = (value: string | null) => {
   if (!value) return null
   return HAS_TIMEZONE_SUFFIX.test(value) ? dayjs(value).local() : dayjs.utc(value).local()
@@ -636,6 +778,7 @@ export default function App({
   const [authFastPollingUntil, setAuthFastPollingUntil] = useState<number | null>(null)
   const [creatorUrlPromptOpen, setCreatorUrlPromptOpen] = useState(false)
   const [downloadCommandPromptOpen, setDownloadCommandPromptOpen] = useState(false)
+  const [isImportingSettings, setIsImportingSettings] = useState(false)
   const autoRefreshTriggeredRef = useRef(false)
   const pendingCreatorUrlSetupAfterLoginRef = useRef(false)
   const creatorUrlPromptDismissedRef = useRef(false)
@@ -646,6 +789,7 @@ export default function App({
   const backGridRef = useRef<HTMLDivElement | null>(null)
   const delayedSettingsSyncRef = useRef<number | null>(null)
   const taskDrawerResizeCleanupRef = useRef<(() => void) | null>(null)
+  const settingsImportInputRef = useRef<HTMLInputElement | null>(null)
   const titleAliasMode = Form.useWatch('mode', titleAliasForm) ?? 'full_title'
 
   useEffect(() => {
@@ -931,7 +1075,7 @@ export default function App({
         queryClient.setQueryData(['settings'], data)
         form.setFieldsValue({
           ...data,
-          follow_system_theme: followSystemTheme,
+          follow_system_theme: form.getFieldValue('follow_system_theme'),
         })
         delayedSettingsSyncRef.current = null
 
@@ -939,6 +1083,9 @@ export default function App({
           refreshMutation.mutate({ mode: 'full', autoRescanAfter: true })
         }
       }, FLOATING_PANEL_EXIT_DELAY_MS)
+    },
+    onError: (error) => {
+      message.error(error instanceof Error ? error.message : '保存设置失败')
     },
   })
 
@@ -1562,6 +1709,65 @@ export default function App({
     const { follow_system_theme, ...settingsPayload } = mergedValues
     onFollowSystemThemeChange(follow_system_theme)
     saveSettingsMutation.mutate(settingsPayload)
+  }
+
+  const handleExportSettings = async () => {
+    const baseSettings = settingsQuery.data
+    if (!baseSettings) {
+      message.error('设置尚未加载完成，请稍后再试')
+      return
+    }
+
+    try {
+      const values = await form.validateFields(SETTINGS_EXPORT_FORM_FIELDS)
+      const exportableSettings = buildExportableSettings({
+        ...baseSettings,
+        ...values,
+      })
+      const transferFile = buildSettingsTransferFile(exportableSettings, values.follow_system_theme)
+      downloadSettingsTransferFile(transferFile)
+      message.success('设置导出已开始')
+    } catch (error) {
+      if (error instanceof Error) {
+        message.error(error.message)
+      }
+    }
+  }
+
+  const handleImportSettingsClick = () => {
+    settingsImportInputRef.current?.click()
+  }
+
+  const handleImportSettingsFile = async (event: ReactChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0]
+    event.target.value = ''
+
+    if (!file) return
+
+    const baseSettings = settingsQuery.data
+    if (!baseSettings) {
+      message.error('设置尚未加载完成，请稍后再试')
+      return
+    }
+
+    setIsImportingSettings(true)
+    try {
+      const parsed = parseSettingsTransferFile(await file.text())
+      const mergedSettings: Settings = {
+        ...baseSettings,
+        ...parsed.settings,
+      }
+
+      form.setFieldsValue({
+        ...mergedSettings,
+        follow_system_theme: parsed.followSystemTheme,
+      })
+      message.success('设置已导入，请点击保存设置生效')
+    } catch (error) {
+      message.error(error instanceof Error ? error.message : '导入设置失败')
+    } finally {
+      setIsImportingSettings(false)
+    }
   }
 
   const handleOpenSettingsFromPrompt = () => {
@@ -2259,6 +2465,13 @@ export default function App({
               </div>
             </section>
           </div>
+          <input
+            ref={settingsImportInputRef}
+            type="file"
+            accept=".json,application/json"
+            style={{ display: 'none' }}
+            onChange={handleImportSettingsFile}
+          />
           <div className="floating-panel-actions">
             <Tag className="floating-panel-status-tag" color={authQuery.data?.authenticated ? 'green' : 'gold'}>
               {authQuery.data?.authenticated ? '已登录' : '未登录'}
@@ -2266,6 +2479,12 @@ export default function App({
             <div className="floating-panel-button-group">
               <Button loading={loginMutation.isPending} onClick={() => loginMutation.mutate()}>
                 打开登录窗口
+              </Button>
+              <Button loading={isImportingSettings} onClick={handleImportSettingsClick}>
+                导入设置
+              </Button>
+              <Button onClick={() => void handleExportSettings()}>
+                导出设置
               </Button>
               <Button type="primary" htmlType="submit" loading={saveSettingsMutation.isPending}>
                 保存设置

@@ -6,6 +6,7 @@ import shutil
 import subprocess
 from enum import StrEnum
 from pathlib import Path
+from zipfile import BadZipFile, ZipFile
 
 
 class MegaDownloadError(RuntimeError):
@@ -23,6 +24,11 @@ class MegaDownloadFailureKind(StrEnum):
     RETRYABLE = "retryable"
     UNAVAILABLE = "unavailable"
     UNKNOWN = "unknown"
+
+
+DOWNLOAD_POLL_INTERVAL_SECONDS = 0.5
+DOWNLOAD_STABLE_POLLS_REQUIRED = 3
+DOWNLOAD_PROCESS_SHUTDOWN_TIMEOUT_SECONDS = 3.0
 
 
 async def download_public_link(link: str, download_dir: str, command_name: str) -> tuple[str, str]:
@@ -43,21 +49,54 @@ async def download_public_link(link: str, download_dir: str, command_name: str) 
         stderr=asyncio.subprocess.STDOUT,
         **_mega_subprocess_kwargs(),
     )
-    stdout, _ = await process.communicate()
-    output = stdout.decode("utf-8", errors="replace")
+    output_task = asyncio.create_task(_read_process_output(process))
+    recovered_candidate: Path | None = None
+    stable_candidate: Path | None = None
+    stable_size: int | None = None
+    stable_polls = 0
+
+    while True:
+        try:
+            await asyncio.wait_for(process.wait(), timeout=DOWNLOAD_POLL_INTERVAL_SECONDS)
+            break
+        except TimeoutError:
+            candidate = _select_download_candidate(destination, before)
+            if candidate is None:
+                continue
+
+            candidate_size = candidate.stat().st_size
+            if stable_candidate == candidate and stable_size == candidate_size:
+                stable_polls += 1
+            else:
+                stable_candidate = candidate
+                stable_size = candidate_size
+                stable_polls = 1
+
+            if stable_polls >= DOWNLOAD_STABLE_POLLS_REQUIRED and _is_complete_download(candidate):
+                recovered_candidate = candidate
+                await _terminate_hung_process(process)
+                break
+
+    output = (await output_task).decode("utf-8", errors="replace")
+    if recovered_candidate is not None:
+        recovered_message = "\n".join(
+            filter(
+                None,
+                [
+                    output.strip(),
+                    f"Recovered downloaded archive after MEGAcmd did not exit cleanly: {recovered_candidate}",
+                ],
+            )
+        )
+        return str(recovered_candidate), recovered_message
+
     if process.returncode != 0:
         message = output.strip() or "MEGAcmd download failed"
         raise MegaDownloadError(message, return_code=process.returncode, output=message)
 
-    after = [path.resolve() for path in destination.rglob("*") if path.is_file() and path.resolve() not in before]
-    if not after:
-        fallback = sorted(destination.rglob("*"), key=lambda path: path.stat().st_mtime, reverse=True)
-        after = [path for path in fallback if path.is_file()]
-
-    if not after:
+    selected = _select_download_candidate(destination, before)
+    if selected is None:
         raise MegaDownloadError("MEGAcmd completed without producing a file", output="MEGAcmd completed without producing a file")
-
-    selected = next((path for path in after if path.suffix.lower() == ".zip"), after[0])
     return str(selected), output.strip()
 
 
@@ -141,3 +180,60 @@ def _mega_subprocess_kwargs() -> dict[str, object]:
         "creationflags": subprocess.CREATE_NO_WINDOW,
         "startupinfo": startupinfo,
     }
+
+
+async def _read_process_output(process: asyncio.subprocess.Process) -> bytes:
+    stream = process.stdout
+    if stream is None:
+        return b""
+
+    chunks: list[bytes] = []
+    while True:
+        chunk = await stream.read(4096)
+        if not chunk:
+            break
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
+async def _terminate_hung_process(process: asyncio.subprocess.Process) -> None:
+    if process.returncode is not None:
+        return
+
+    process.terminate()
+    try:
+        await asyncio.wait_for(process.wait(), timeout=DOWNLOAD_PROCESS_SHUTDOWN_TIMEOUT_SECONDS)
+        return
+    except TimeoutError:
+        pass
+
+    process.kill()
+    await asyncio.wait_for(process.wait(), timeout=DOWNLOAD_PROCESS_SHUTDOWN_TIMEOUT_SECONDS)
+
+
+def _select_download_candidate(destination: Path, before: set[Path]) -> Path | None:
+    after = [path.resolve() for path in destination.rglob("*") if path.is_file() and path.resolve() not in before]
+    if not after:
+        fallback = sorted(destination.rglob("*"), key=lambda path: path.stat().st_mtime, reverse=True)
+        after = [path.resolve() for path in fallback if path.is_file()]
+
+    if not after:
+        return None
+
+    return next((path for path in after if path.suffix.lower() == ".zip"), after[0])
+
+
+def _is_complete_download(path: Path) -> bool:
+    if not path.exists() or not path.is_file():
+        return False
+    if path.stat().st_size <= 0:
+        return False
+    if path.suffix.lower() != ".zip":
+        return True
+
+    try:
+        with ZipFile(path) as archive:
+            archive.testzip()
+        return True
+    except (BadZipFile, OSError):
+        return False
