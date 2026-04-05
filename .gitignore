@@ -30,3 +30,6 @@ frontend/dist/
 
 # Local logs
 *.log
+
+# Local title annotation dictionary
+backend/app/core/title_aliases.json
