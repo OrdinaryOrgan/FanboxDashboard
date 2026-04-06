@@ -159,6 +159,105 @@ def test_clear_title_aliases_rewrites_empty_payload(tmp_path: Path) -> None:
     assert alias_file.read_text(encoding="utf-8") == '{\n  "version": 1,\n  "full_titles": {},\n  "phrase_fragments": {},\n  "fragments": {}\n}'
 
 
+def test_export_title_aliases_returns_current_payload(tmp_path: Path) -> None:
+    alias_file = tmp_path / "aliases" / "title_aliases.json"
+    alias_file.parent.mkdir(parents=True, exist_ok=True)
+    alias_file.write_text(
+        '{\n  "version": 1,\n  "full_titles": {"A": "甲"},\n  "phrase_fragments": {"B C": "乙"},\n  "fragments": {"D": "丙"}\n}',
+        encoding="utf-8",
+    )
+
+    with SessionLocal() as session:
+        settings = session.get(Settings, 1)
+        assert settings is not None
+        settings.title_aliases_path = str(alias_file)
+        session.commit()
+
+    client = TestClient(app)
+    response = client.get("/api/title-aliases/export")
+
+    assert response.status_code == 200
+    assert response.json()["data"] == {
+        "version": 1,
+        "full_titles": {"A": "甲"},
+        "phrase_fragments": {"B C": "乙"},
+        "fragments": {"D": "丙"},
+    }
+
+
+def test_import_title_aliases_overwrites_current_payload(tmp_path: Path) -> None:
+    alias_file = tmp_path / "aliases" / "title_aliases.json"
+    alias_file.parent.mkdir(parents=True, exist_ok=True)
+    alias_file.write_text(
+        '{"version":1,"full_titles":{"OLD":"旧"},"phrase_fragments":{},"fragments":{"OLD":"旧"}}',
+        encoding="utf-8",
+    )
+
+    with SessionLocal() as session:
+        settings = session.get(Settings, 1)
+        assert settings is not None
+        settings.title_aliases_path = str(alias_file)
+        session.commit()
+
+    client = TestClient(app)
+    response = client.post(
+        "/api/title-aliases/import",
+        json={
+            "version": 1,
+            "full_titles": {"ベルファスト": "贝尔法斯特"},
+            "phrase_fragments": {"メイド隊": "女仆队"},
+            "fragments": {"アズレン": "碧蓝航线"},
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["data"] == {
+        "imported_path": str(alias_file),
+        "full_title_count": 1,
+        "phrase_fragment_count": 1,
+        "fragment_count": 1,
+    }
+    assert alias_file.read_text(encoding="utf-8") == (
+        '{\n'
+        '  "version": 1,\n'
+        '  "full_titles": {\n'
+        '    "ベルファスト": "贝尔法斯特"\n'
+        '  },\n'
+        '  "phrase_fragments": {\n'
+        '    "メイド隊": "女仆队"\n'
+        '  },\n'
+        '  "fragments": {\n'
+        '    "アズレン": "碧蓝航线"\n'
+        '  }\n'
+        '}'
+    )
+
+
+def test_import_title_aliases_rejects_unsupported_version(tmp_path: Path) -> None:
+    alias_file = tmp_path / "aliases" / "title_aliases.json"
+
+    with SessionLocal() as session:
+        settings = session.get(Settings, 1)
+        assert settings is not None
+        settings.title_aliases_path = str(alias_file)
+        session.commit()
+
+    client = TestClient(app)
+    response = client.post(
+        "/api/title-aliases/import",
+        json={
+            "version": 2,
+            "full_titles": {},
+            "phrase_fragments": {},
+            "fragments": {},
+        },
+    )
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == "Only title aliases version 1 is supported."
+    assert alias_file.exists() is False
+
+
 def test_clear_title_annotation_cache_resets_posts_to_pending_or_skipped() -> None:
     with SessionLocal() as session:
         session.add_all(

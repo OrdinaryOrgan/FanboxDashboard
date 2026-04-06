@@ -126,6 +126,20 @@ export type TitleAliasesClearResult = {
   cleared_path: string
 }
 
+export type TitleAliasesPayload = {
+  version: 1
+  full_titles: Record<string, string>
+  phrase_fragments: Record<string, string>
+  fragments: Record<string, string>
+}
+
+export type TitleAliasesImportResult = {
+  imported_path: string
+  full_title_count: number
+  phrase_fragment_count: number
+  fragment_count: number
+}
+
 export type TitleAnnotationCacheClearResult = {
   reset_count: number
 }

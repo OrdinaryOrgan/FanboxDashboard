@@ -33,3 +33,6 @@ frontend/dist/
 
 # Local title annotation dictionary
 backend/app/core/title_aliases.json
+
+# Local PlayWright testing results
+output/

@@ -31,6 +31,7 @@ from app.schemas.settings import (
     TitleAnnotationCacheClearResult,
 )
 from app.schemas.task import RetryRequest, TaskClearResult, TaskRead
+from app.schemas.title_aliases import TitleAliasesImportResult, TitleAliasesPayload
 from app.services.fanbox import inspect_auth_status, logout_fanbox
 from app.services.files import delete_archive_file, open_in_explorer, purge_archive_files, resolve_post_open_path
 from app.services.mega import MegaCommandConfigurationError, classify_mega_download_failure
@@ -39,7 +40,10 @@ from app.services.title_annotation import (
     build_display_title,
     clear_title_aliases_file,
     ensure_title_aliases_file,
+    export_title_aliases_payload,
+    import_title_aliases_payload,
     load_title_aliases,
+    normalize_title_aliases_payload,
     prepare_post_title_annotation,
     resolve_dictionary_annotation,
     resolve_title_aliases_path,
@@ -350,6 +354,37 @@ def create_router(task_manager: TaskManager) -> APIRouter:
 
         aliases_path = clear_title_aliases_file(resolve_title_aliases_path(settings))
         return Envelope(message="Local title aliases cleared.", data=TitleAliasesClearResult(cleared_path=str(aliases_path)))
+
+    @router.get("/title-aliases/export", response_model=Envelope[TitleAliasesPayload])
+    def export_title_aliases(db: Session = Depends(get_db)) -> Envelope[TitleAliasesPayload]:
+        settings = db.get(Settings, 1)
+        assert settings is not None
+
+        payload = export_title_aliases_payload(resolve_title_aliases_path(settings))
+        return Envelope(data=TitleAliasesPayload.model_validate(payload))
+
+    @router.post("/title-aliases/import", response_model=Envelope[TitleAliasesImportResult])
+    def import_title_aliases(payload: TitleAliasesPayload, db: Session = Depends(get_db)) -> Envelope[TitleAliasesImportResult]:
+        settings = db.get(Settings, 1)
+        assert settings is not None
+
+        try:
+            imported_path, normalized_payload = import_title_aliases_payload(
+                resolve_title_aliases_path(settings),
+                normalize_title_aliases_payload(payload.model_dump()),
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+        return Envelope(
+            message="Local title aliases imported.",
+            data=TitleAliasesImportResult(
+                imported_path=str(imported_path),
+                full_title_count=len(normalized_payload["full_titles"]),
+                phrase_fragment_count=len(normalized_payload["phrase_fragments"]),
+                fragment_count=len(normalized_payload["fragments"]),
+            ),
+        )
 
     @router.post("/title-aliases/upsert", response_model=Envelope[TitleAliasUpsertResult])
     def upsert_title_aliases(payload: TitleAliasUpsertRequest, db: Session = Depends(get_db)) -> Envelope[TitleAliasUpsertResult]:

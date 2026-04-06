@@ -64,6 +64,7 @@ import type {
   Settings,
   SettingsTransferFile,
   Task,
+  TitleAliasesPayload,
   TitleAliasUpsertRequest,
 } from './types'
 
@@ -283,6 +284,67 @@ function downloadSettingsTransferFile(file: SettingsTransferFile) {
   const anchor = document.createElement('a')
   anchor.href = downloadUrl
   anchor.download = buildSettingsExportFileName()
+  document.body.appendChild(anchor)
+  anchor.click()
+  anchor.remove()
+  window.URL.revokeObjectURL(downloadUrl)
+}
+
+const readTitleAliasesSection = (record: Record<string, unknown>, fieldName: string) => {
+  const value = record[fieldName]
+  if (!isRecord(value)) {
+    throw new Error(`词库文件缺少有效字段：${fieldName}`)
+  }
+
+  const normalized: Record<string, string> = {}
+  for (const [source, target] of Object.entries(value)) {
+    if (typeof target !== 'string') {
+      throw new Error(`词库文件中的 ${fieldName} 必须是字符串映射`)
+    }
+    const trimmedSource = source.trim()
+    const trimmedTarget = target.trim()
+    if (!trimmedSource || !trimmedTarget) continue
+    normalized[trimmedSource] = trimmedTarget
+  }
+  return normalized
+}
+
+function parseTitleAliasesPayload(raw: string): TitleAliasesPayload {
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(raw)
+  } catch {
+    throw new Error('词库文件不是有效的 JSON')
+  }
+
+  if (!isRecord(parsed)) {
+    throw new Error('词库文件结构无效')
+  }
+  if (parsed.version !== 1) {
+    throw new Error('只支持导入 version=1 的词库文件')
+  }
+
+  return {
+    version: 1,
+    full_titles: readTitleAliasesSection(parsed, 'full_titles'),
+    phrase_fragments: readTitleAliasesSection(parsed, 'phrase_fragments'),
+    fragments: readTitleAliasesSection(parsed, 'fragments'),
+  }
+}
+
+function buildTitleAliasesExportFileName() {
+  const now = new Date()
+  const pad = (value: number) => String(value).padStart(2, '0')
+  const timestamp = `${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}-${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}`
+  return `fanbox-title-aliases-${timestamp}.json`
+}
+
+function downloadTitleAliasesPayload(payload: TitleAliasesPayload) {
+  const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json;charset=utf-8' })
+  const downloadUrl = window.URL.createObjectURL(blob)
+  const anchor = document.createElement('a')
+  anchor.href = downloadUrl
+  anchor.download = buildTitleAliasesExportFileName()
   document.body.appendChild(anchor)
   anchor.click()
   anchor.remove()
@@ -782,6 +844,8 @@ export default function App({
   const [creatorUrlPromptOpen, setCreatorUrlPromptOpen] = useState(false)
   const [downloadCommandPromptOpen, setDownloadCommandPromptOpen] = useState(false)
   const [isImportingSettings, setIsImportingSettings] = useState(false)
+  const [isImportingTitleAliases, setIsImportingTitleAliases] = useState(false)
+  const [isExportingTitleAliases, setIsExportingTitleAliases] = useState(false)
   const autoRefreshTriggeredRef = useRef(false)
   const pendingCreatorUrlSetupAfterLoginRef = useRef(false)
   const creatorUrlPromptDismissedRef = useRef(false)
@@ -793,6 +857,7 @@ export default function App({
   const delayedSettingsSyncRef = useRef<number | null>(null)
   const taskDrawerResizeCleanupRef = useRef<(() => void) | null>(null)
   const settingsImportInputRef = useRef<HTMLInputElement | null>(null)
+  const titleAliasesImportInputRef = useRef<HTMLInputElement | null>(null)
   const titleAliasMode = Form.useWatch('mode', titleAliasForm) ?? 'full_title'
 
   useEffect(() => {
@@ -1039,6 +1104,17 @@ export default function App({
     },
     onError: (error) => {
       message.error(error instanceof Error ? error.message : '清空词库失败')
+    },
+  })
+
+  const importTitleAliasesMutation = useMutation({
+    mutationFn: api.importTitleAliases,
+    onSuccess: async () => {
+      message.success('词库已导入')
+      await queryClient.invalidateQueries({ queryKey: ['posts'] })
+    },
+    onError: (error) => {
+      message.error(error instanceof Error ? error.message : '导入词库失败')
     },
   })
 
@@ -1800,6 +1876,69 @@ export default function App({
       message.error(error instanceof Error ? error.message : '导入设置失败')
     } finally {
       setIsImportingSettings(false)
+    }
+  }
+
+  const ensureSavedTitleAliasesPathForTransfer = () => {
+    const savedPath = settingsQuery.data?.title_aliases_path?.trim()
+    if (!savedPath) {
+      message.error('设置尚未加载完成，请稍后再试')
+      return false
+    }
+
+    const currentPath = String(form.getFieldValue('title_aliases_path') ?? savedPath).trim()
+    if (currentPath !== savedPath) {
+      message.warning('词库文件路径有未保存修改，请先保存设置后再导入或导出词库')
+      return false
+    }
+
+    return true
+  }
+
+  const handleExportTitleAliases = async () => {
+    if (!ensureSavedTitleAliasesPathForTransfer()) {
+      return
+    }
+
+    setIsExportingTitleAliases(true)
+    try {
+      const payload = await api.exportTitleAliases()
+      downloadTitleAliasesPayload(payload)
+      message.success('词库导出已开始')
+    } catch (error) {
+      message.error(error instanceof Error ? error.message : '导出词库失败')
+    } finally {
+      setIsExportingTitleAliases(false)
+    }
+  }
+
+  const handleImportTitleAliasesClick = () => {
+    if (!ensureSavedTitleAliasesPathForTransfer()) {
+      return
+    }
+    titleAliasesImportInputRef.current?.click()
+  }
+
+  const handleImportTitleAliasesFile = async (event: ReactChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0]
+    event.target.value = ''
+
+    if (!file) return
+    if (!ensureSavedTitleAliasesPathForTransfer()) return
+
+    let payload: TitleAliasesPayload
+    try {
+      payload = parseTitleAliasesPayload(await file.text())
+    } catch (error) {
+      message.error(error instanceof Error ? error.message : '导入词库失败')
+      return
+    }
+
+    setIsImportingTitleAliases(true)
+    try {
+      await importTitleAliasesMutation.mutateAsync(payload)
+    } finally {
+      setIsImportingTitleAliases(false)
     }
   }
 
@@ -2839,7 +2978,24 @@ export default function App({
                   <Input placeholder="C:\\path\\to\\title_aliases.json" />
                 </Form.Item>
               </div>
+              <input
+                ref={titleAliasesImportInputRef}
+                type="file"
+                accept=".json,application/json"
+                style={{ display: 'none' }}
+                onChange={handleImportTitleAliasesFile}
+              />
               <div className="settings-section-actions floating-panel-button-group">
+                <Button
+                  className="llm-neutral-button"
+                  loading={isImportingTitleAliases || importTitleAliasesMutation.isPending}
+                  onClick={handleImportTitleAliasesClick}
+                >
+                  导入词库
+                </Button>
+                <Button className="llm-neutral-button" loading={isExportingTitleAliases} onClick={() => void handleExportTitleAliases()}>
+                  导出词库
+                </Button>
                 <Button
                   className="llm-neutral-button"
                   icon={<FolderOpenOutlined />}

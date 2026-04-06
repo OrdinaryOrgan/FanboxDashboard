@@ -17,6 +17,19 @@ def test_resolve_mega_command_from_directory(tmp_path: Path) -> None:
     assert use_cmd_shell is True
 
 
+def test_resolve_mega_command_from_directory_prefers_megaclient(monkeypatch, tmp_path: Path) -> None:
+    command_dir = tmp_path / "megacmd"
+    command_dir.mkdir()
+    (command_dir / "mega-get.bat").write_text("@echo off\n", encoding="utf-8")
+    executable = command_dir / "MegaClient.exe"
+    executable.write_bytes(b"")
+
+    command, use_cmd_shell = resolve_mega_command(str(command_dir))
+
+    assert command == [str(executable), "get"]
+    assert use_cmd_shell is False
+
+
 def test_resolve_mega_command_from_executable_path(tmp_path: Path) -> None:
     executable = tmp_path / "MEGAclient.exe"
     executable.write_bytes(b"")
@@ -95,3 +108,39 @@ def test_download_public_link_recovers_when_process_hangs_after_zip_is_complete(
 
     assert Path(archive_path).name == "sample.zip"
     assert "Recovered downloaded archive after MEGAcmd did not exit cleanly" in output
+
+
+def test_download_public_link_returns_when_stdout_never_finishes_after_process_exit(monkeypatch, tmp_path: Path) -> None:
+    class FakeStdout:
+        async def read(self, _: int) -> bytes:
+            await asyncio.sleep(10)
+            return b""
+
+    class FakeProcess:
+        def __init__(self) -> None:
+            self.returncode = 0
+            self.stdout = FakeStdout()
+
+        async def wait(self) -> int:
+            return 0
+
+    async def fake_create_subprocess_exec(*args, **kwargs):
+        destination = Path(args[-1])
+        destination.mkdir(parents=True, exist_ok=True)
+        with ZipFile(destination / "sample.zip", "w") as archive:
+            archive.writestr("sample.txt", b"hello")
+        return FakeProcess()
+
+    monkeypatch.setattr("app.services.mega.asyncio.create_subprocess_exec", fake_create_subprocess_exec)
+    monkeypatch.setattr("app.services.mega.DOWNLOAD_POLL_INTERVAL_SECONDS", 0.01)
+    monkeypatch.setattr("app.services.mega.DOWNLOAD_OUTPUT_DRAIN_TIMEOUT_SECONDS", 0.01)
+
+    fake_command = tmp_path / "mega-get.exe"
+    fake_command.write_bytes(b"")
+
+    archive_path, output = asyncio.run(
+        download_public_link("https://mega.nz/file/test", str(tmp_path / "downloads"), str(fake_command))
+    )
+
+    assert Path(archive_path).name == "sample.zip"
+    assert output == ""

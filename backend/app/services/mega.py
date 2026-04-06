@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import suppress
 import os
 import shutil
 import subprocess
@@ -29,6 +30,7 @@ class MegaDownloadFailureKind(StrEnum):
 DOWNLOAD_POLL_INTERVAL_SECONDS = 0.5
 DOWNLOAD_STABLE_POLLS_REQUIRED = 3
 DOWNLOAD_PROCESS_SHUTDOWN_TIMEOUT_SECONDS = 3.0
+DOWNLOAD_OUTPUT_DRAIN_TIMEOUT_SECONDS = 1.0
 
 
 async def download_public_link(link: str, download_dir: str, command_name: str) -> tuple[str, str]:
@@ -49,7 +51,8 @@ async def download_public_link(link: str, download_dir: str, command_name: str) 
         stderr=asyncio.subprocess.STDOUT,
         **_mega_subprocess_kwargs(),
     )
-    output_task = asyncio.create_task(_read_process_output(process))
+    output_chunks: list[bytes] = []
+    output_task = asyncio.create_task(_read_process_output(process, output_chunks))
     recovered_candidate: Path | None = None
     stable_candidate: Path | None = None
     stable_size: int | None = None
@@ -77,7 +80,7 @@ async def download_public_link(link: str, download_dir: str, command_name: str) 
                 await _terminate_hung_process(process)
                 break
 
-    output = (await output_task).decode("utf-8", errors="replace")
+    output = (await _resolve_output_bytes(output_task, output_chunks)).decode("utf-8", errors="replace")
     if recovered_candidate is not None:
         recovered_message = "\n".join(
             filter(
@@ -90,11 +93,12 @@ async def download_public_link(link: str, download_dir: str, command_name: str) 
         )
         return str(recovered_candidate), recovered_message
 
+    selected = _select_download_candidate(destination, before)
+
     if process.returncode != 0:
         message = output.strip() or "MEGAcmd download failed"
         raise MegaDownloadError(message, return_code=process.returncode, output=message)
 
-    selected = _select_download_candidate(destination, before)
     if selected is None:
         raise MegaDownloadError("MEGAcmd completed without producing a file", output="MEGAcmd completed without producing a file")
     return str(selected), output.strip()
@@ -107,7 +111,7 @@ def resolve_mega_command(command_name: str) -> tuple[list[str], bool]:
 
     raw_path = Path(raw_value)
     if raw_path.is_dir():
-        for candidate in ("mega-get.bat", "MegaClient.exe", "mega-get.exe"):
+        for candidate in ("MegaClient.exe", "mega-get.exe", "mega-get.bat"):
                 resolved = raw_path / candidate
                 if resolved.exists():
                     return _normalize_command_path(resolved)
@@ -182,18 +186,18 @@ def _mega_subprocess_kwargs() -> dict[str, object]:
     }
 
 
-async def _read_process_output(process: asyncio.subprocess.Process) -> bytes:
+async def _read_process_output(process: asyncio.subprocess.Process, chunks: list[bytes] | None = None) -> bytes:
     stream = process.stdout
     if stream is None:
         return b""
 
-    chunks: list[bytes] = []
+    target_chunks = chunks if chunks is not None else []
     while True:
         chunk = await stream.read(4096)
         if not chunk:
             break
-        chunks.append(chunk)
-    return b"".join(chunks)
+        target_chunks.append(chunk)
+    return b"".join(target_chunks)
 
 
 async def _terminate_hung_process(process: asyncio.subprocess.Process) -> None:
@@ -209,6 +213,16 @@ async def _terminate_hung_process(process: asyncio.subprocess.Process) -> None:
 
     process.kill()
     await asyncio.wait_for(process.wait(), timeout=DOWNLOAD_PROCESS_SHUTDOWN_TIMEOUT_SECONDS)
+
+
+async def _resolve_output_bytes(output_task: asyncio.Task[bytes], chunks: list[bytes]) -> bytes:
+    try:
+        return await asyncio.wait_for(asyncio.shield(output_task), timeout=DOWNLOAD_OUTPUT_DRAIN_TIMEOUT_SECONDS)
+    except TimeoutError:
+        output_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await output_task
+        return b"".join(chunks)
 
 
 def _select_download_candidate(destination: Path, before: set[Path]) -> Path | None:

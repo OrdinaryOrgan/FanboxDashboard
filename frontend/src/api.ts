@@ -9,6 +9,8 @@ import type {
   Task,
   TaskClearResult,
   TitleAnnotationCacheClearResult,
+  TitleAliasesImportResult,
+  TitleAliasesPayload,
   TitleAliasUpsertRequest,
   TitleAliasUpsertResult,
   TitleAliasesClearResult,
@@ -87,6 +89,12 @@ export const api = {
     request<OpenPathResult>('/api/library/open-year', {
       method: 'POST',
       body: JSON.stringify({ year }),
+    }),
+  exportTitleAliases: () => request<TitleAliasesPayload>('/api/title-aliases/export'),
+  importTitleAliases: (payload: TitleAliasesPayload) =>
+    request<TitleAliasesImportResult>('/api/title-aliases/import', {
+      method: 'POST',
+      body: JSON.stringify(payload),
     }),
   openTitleAliasesPath: () => request<OpenPathResult>('/api/title-aliases/open', { method: 'POST' }),
   clearTitleAliases: () => request<TitleAliasesClearResult>('/api/title-aliases/clear', { method: 'POST' }),

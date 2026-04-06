@@ -62,21 +62,63 @@ EMPTY_TITLE_ALIASES_PAYLOAD = {
 }
 
 
+def _normalize_title_aliases_section(payload: Any, field_name: str) -> dict[str, str]:
+    if payload is None:
+        return {}
+    if not isinstance(payload, dict):
+        raise ValueError(f"{field_name} must be an object.")
+
+    normalized: dict[str, str] = {}
+    for key, value in payload.items():
+        if not isinstance(key, str):
+            raise ValueError(f"{field_name} keys must be strings.")
+        if not isinstance(value, str):
+            raise ValueError(f"{field_name} values must be strings.")
+
+        source = key.strip()
+        target = value.strip()
+        if not source or not target:
+            continue
+        normalized[source] = target
+    return normalized
+
+
+def normalize_title_aliases_payload(payload: Any) -> dict[str, Any]:
+    if not isinstance(payload, dict):
+        raise ValueError("Title aliases payload must be a JSON object.")
+
+    version_raw = payload.get("version", 1)
+    if isinstance(version_raw, bool):
+        raise ValueError("version must be an integer.")
+    if isinstance(version_raw, int):
+        version = version_raw
+    elif isinstance(version_raw, str) and version_raw.strip().isdigit():
+        version = int(version_raw.strip())
+    else:
+        raise ValueError("version must be an integer.")
+
+    if version != 1:
+        raise ValueError("Only title aliases version 1 is supported.")
+
+    return {
+        "version": version,
+        "full_titles": _normalize_title_aliases_section(payload.get("full_titles", {}), "full_titles"),
+        "phrase_fragments": _normalize_title_aliases_section(payload.get("phrase_fragments", {}), "phrase_fragments"),
+        "fragments": _normalize_title_aliases_section(payload.get("fragments", {}), "fragments"),
+    }
+
+
 def _load_title_aliases_payload(path: Path) -> dict[str, Any]:
     ensure_title_aliases_file(path)
-    payload = json.loads(path.read_text(encoding="utf-8"))
-    if not isinstance(payload, dict):
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
         return dict(EMPTY_TITLE_ALIASES_PAYLOAD)
-    normalized_payload: dict[str, Any] = {
-        "version": payload.get("version", 1),
-        "full_titles": payload.get("full_titles", {}),
-        "phrase_fragments": payload.get("phrase_fragments", {}),
-        "fragments": payload.get("fragments", {}),
-    }
-    for key in ("full_titles", "phrase_fragments", "fragments"):
-        if not isinstance(normalized_payload[key], dict):
-            normalized_payload[key] = {}
-    return normalized_payload
+
+    try:
+        return normalize_title_aliases_payload(payload)
+    except ValueError:
+        return dict(EMPTY_TITLE_ALIASES_PAYLOAD)
 
 
 def build_display_title(title: str, annotation: str | None) -> str:
@@ -119,6 +161,17 @@ def clear_title_aliases_file(path: Path) -> Path:
     ensure_title_aliases_file(path)
     path.write_text(json.dumps(EMPTY_TITLE_ALIASES_PAYLOAD, ensure_ascii=False, indent=2), encoding="utf-8")
     return path
+
+
+def export_title_aliases_payload(path: Path) -> dict[str, Any]:
+    return _load_title_aliases_payload(path)
+
+
+def import_title_aliases_payload(path: Path, payload: Any) -> tuple[Path, dict[str, Any]]:
+    normalized_payload = normalize_title_aliases_payload(payload)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(normalized_payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    return path, normalized_payload
 
 
 def upsert_title_alias_entries(path: Path, mode: str, updates: list[tuple[str, str]]) -> tuple[Path, int]:
