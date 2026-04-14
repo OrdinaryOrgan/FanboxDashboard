@@ -43,8 +43,9 @@ def setup_function() -> None:
 def test_download_archive_with_retries_recovers_from_server_231(monkeypatch) -> None:
     attempts = {"count": 0}
 
-    async def fake_download_public_link(link: str, download_dir: str, command_name: str):
+    async def fake_download_public_link(link: str, download_dir: str, command_name: str, *, expected_prefixes=()):
         attempts["count"] += 1
+        assert expected_prefixes == ("sample",)
         if attempts["count"] < 3:
             raise MegaDownloadError("Failed to access server: 231", return_code=3)
         return "C:/tmp/sample.zip", "download ok"
@@ -57,7 +58,12 @@ def test_download_archive_with_retries_recovers_from_server_231(monkeypatch) -> 
 
     manager = TaskManager()
     archive_path, log_output = asyncio.run(
-        manager._download_archive_with_retries("https://mega.nz/file/test", "C:/tmp", "mega-get")
+        manager._download_archive_with_retries(
+            "https://mega.nz/file/test",
+            "C:/tmp",
+            "mega-get",
+            expected_archive_prefixes=("sample",),
+        )
     )
 
     assert attempts["count"] == 3
@@ -226,7 +232,14 @@ def test_run_download_times_out_and_marks_task_failed(monkeypatch) -> None:
         session.commit()
         post_db_id = post.id
 
-    async def fake_download_archive_with_retries(self, mega_url: str, download_dir: str, mega_command: str) -> tuple[str, str]:
+    async def fake_download_archive_with_retries(
+        self,
+        mega_url: str,
+        download_dir: str,
+        mega_command: str,
+        *,
+        expected_archive_prefixes: tuple[str, ...] = (),
+    ) -> tuple[str, str]:
         await asyncio.sleep(2)
         return "", ""
 
@@ -292,7 +305,14 @@ def test_run_download_reuses_existing_archive_without_calling_mega(monkeypatch, 
     with ZipFile(archive_path, "w") as archive:
         archive.writestr("A2/existing1.jpg", b"jpg")
 
-    async def fail_if_called(self, mega_url: str, download_dir: str, mega_command: str) -> tuple[str, str]:
+    async def fail_if_called(
+        self,
+        mega_url: str,
+        download_dir: str,
+        mega_command: str,
+        *,
+        expected_archive_prefixes: tuple[str, ...] = (),
+    ) -> tuple[str, str]:
         raise AssertionError("MEGA download should not run when a matching archive already exists")
 
     captured_during_extract: dict[str, str] = {}

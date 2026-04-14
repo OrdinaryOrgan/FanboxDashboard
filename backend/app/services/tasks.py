@@ -462,7 +462,12 @@ class TaskManager:
                     self._mark_post_operation_status(post_db_id, PostOperationStatus.RUNNING_DOWNLOAD.value)
                     self._mark_started(task_id, TaskStatus.RUNNING_DOWNLOAD.value, "Downloading archive from MEGA.")
                     archive_path, mega_log = await asyncio.wait_for(
-                        self._download_archive_with_retries(mega_url, paths.download_dir, mega_command),
+                        self._download_archive_with_retries(
+                            mega_url,
+                            paths.download_dir,
+                            mega_command,
+                            expected_archive_prefixes=(paths.folder_name, post.post_id),
+                        ),
                         timeout=_resolve_download_timeout_seconds(),
                     )
                     self._append_log(task_id, mega_log)
@@ -857,14 +862,26 @@ class TaskManager:
             post.download_return_code = return_code
             session.commit()
 
-    async def _download_archive_with_retries(self, mega_url: str, download_dir: str, mega_command: str) -> tuple[str, str]:
+    async def _download_archive_with_retries(
+        self,
+        mega_url: str,
+        download_dir: str,
+        mega_command: str,
+        *,
+        expected_archive_prefixes: tuple[str, ...] = (),
+    ) -> tuple[str, str]:
         attempts = 3
         logs: list[str] = []
         last_error: MegaDownloadError | None = None
 
         for attempt in range(1, attempts + 1):
             try:
-                archive_path, mega_log = await download_public_link(mega_url, download_dir, mega_command)
+                archive_path, mega_log = await download_public_link(
+                    mega_url,
+                    download_dir,
+                    mega_command,
+                    expected_prefixes=expected_archive_prefixes,
+                )
                 if logs:
                     mega_log = "\n".join([*logs, mega_log])
                 return archive_path, mega_log

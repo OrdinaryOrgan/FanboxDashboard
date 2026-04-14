@@ -5,6 +5,7 @@ from contextlib import suppress
 import os
 import shutil
 import subprocess
+import unicodedata
 from enum import StrEnum
 from pathlib import Path
 from zipfile import BadZipFile, ZipFile
@@ -33,12 +34,18 @@ DOWNLOAD_PROCESS_SHUTDOWN_TIMEOUT_SECONDS = 3.0
 DOWNLOAD_OUTPUT_DRAIN_TIMEOUT_SECONDS = 1.0
 
 
-async def download_public_link(link: str, download_dir: str, command_name: str) -> tuple[str, str]:
+async def download_public_link(
+    link: str,
+    download_dir: str,
+    command_name: str,
+    *,
+    expected_prefixes: tuple[str, ...] = (),
+) -> tuple[str, str]:
     command_parts, use_cmd_shell = resolve_mega_command(command_name)
 
     destination = Path(download_dir)
     destination.mkdir(parents=True, exist_ok=True)
-    before = {path.resolve() for path in destination.rglob("*") if path.is_file()}
+    before = _snapshot_download_dir(destination)
 
     args = [*command_parts, link, str(destination)]
     if use_cmd_shell:
@@ -63,7 +70,7 @@ async def download_public_link(link: str, download_dir: str, command_name: str) 
             await asyncio.wait_for(process.wait(), timeout=DOWNLOAD_POLL_INTERVAL_SECONDS)
             break
         except TimeoutError:
-            candidate = _select_download_candidate(destination, before)
+            candidate = _select_download_candidate(destination, before, expected_prefixes=expected_prefixes)
             if candidate is None:
                 continue
 
@@ -93,7 +100,7 @@ async def download_public_link(link: str, download_dir: str, command_name: str) 
         )
         return str(recovered_candidate), recovered_message
 
-    selected = _select_download_candidate(destination, before)
+    selected = _select_download_candidate(destination, before, expected_prefixes=expected_prefixes)
 
     if process.returncode != 0:
         message = output.strip() or "MEGAcmd download failed"
@@ -225,16 +232,46 @@ async def _resolve_output_bytes(output_task: asyncio.Task[bytes], chunks: list[b
         return b"".join(chunks)
 
 
-def _select_download_candidate(destination: Path, before: set[Path]) -> Path | None:
-    after = [path.resolve() for path in destination.rglob("*") if path.is_file() and path.resolve() not in before]
-    if not after:
-        fallback = sorted(destination.rglob("*"), key=lambda path: path.stat().st_mtime, reverse=True)
-        after = [path.resolve() for path in fallback if path.is_file()]
+def _snapshot_download_dir(destination: Path) -> dict[Path, tuple[int, int]]:
+    snapshots: dict[Path, tuple[int, int]] = {}
+    for path in destination.rglob("*"):
+        if not path.is_file():
+            continue
+        try:
+            resolved = path.resolve()
+            stat = resolved.stat()
+        except OSError:
+            continue
+        snapshots[resolved] = (stat.st_size, stat.st_mtime_ns)
+    return snapshots
 
+
+def _select_download_candidate(
+    destination: Path,
+    before: dict[Path, tuple[int, int]],
+    *,
+    expected_prefixes: tuple[str, ...] = (),
+) -> Path | None:
+    after = [
+        path
+        for path, fingerprint in _snapshot_download_dir(destination).items()
+        if before.get(path) != fingerprint
+    ]
     if not after:
         return None
 
-    return next((path for path in after if path.suffix.lower() == ".zip"), after[0])
+    normalized_prefixes = tuple(
+        _normalize_for_matching(prefix)
+        for prefix in expected_prefixes
+        if prefix and prefix.strip()
+    )
+    candidates = sorted(after, key=_candidate_sort_key, reverse=True)
+    if normalized_prefixes:
+        candidates = [path for path in candidates if _candidate_matches_expected(path, normalized_prefixes)]
+        if not candidates:
+            return None
+
+    return next((path for path in candidates if path.suffix.lower() == ".zip"), candidates[0])
 
 
 def _is_complete_download(path: Path) -> bool:
@@ -251,3 +288,24 @@ def _is_complete_download(path: Path) -> bool:
         return True
     except (BadZipFile, OSError):
         return False
+
+
+def _candidate_sort_key(path: Path) -> tuple[int, int, str]:
+    try:
+        stat = path.stat()
+    except OSError:
+        return (0, 0, path.name.casefold())
+    return (stat.st_mtime_ns, stat.st_size, path.name.casefold())
+
+
+def _candidate_matches_expected(path: Path, normalized_prefixes: tuple[str, ...]) -> bool:
+    normalized_stem = _normalize_for_matching(path.stem)
+    normalized_name = _normalize_for_matching(path.name)
+    return any(
+        normalized_stem.startswith(prefix) or normalized_name.startswith(prefix)
+        for prefix in normalized_prefixes
+    )
+
+
+def _normalize_for_matching(value: str) -> str:
+    return unicodedata.normalize("NFC", value).casefold()
