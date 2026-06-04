@@ -4,6 +4,7 @@ import asyncio
 import ctypes
 import re
 import shutil
+import socket
 import threading
 from contextlib import asynccontextmanager
 from collections.abc import Awaitable, Callable, Mapping
@@ -11,6 +12,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
+from urllib.request import getproxies
 
 from app.core.default_settings import default_setting_value
 from app.db.models import PostStatus, RefreshMode, Settings
@@ -25,6 +27,8 @@ AUTH_CHECK_URL = "https://www.fanbox.cc/notifications"
 AUTH_CHECK_TIMEOUT_MS = 20000
 PERSISTENT_CONTEXT_LAUNCH_RETRY_DELAYS_SECONDS = (0.35, 0.9, 1.8)
 CHROMIUM_WINDOW_CLASSES = {"Chrome_WidgetWin_0", "Chrome_WidgetWin_1"}
+PLAYWRIGHT_PROXY_BYPASS = "127.0.0.1,localhost,::1"
+PROXY_CONNECT_TIMEOUT_SECONDS = 0.35
 _PROFILE_CONTEXT_LOCKS: dict[str, asyncio.Lock] = {}
 _PROFILE_CONTEXT_LOCKS_GUARD = threading.Lock()
 
@@ -136,8 +140,13 @@ async def open_login_window(settings: Settings) -> str:
                 await _wait_for_login_completion(context, page, timeout_seconds=LOGIN_WINDOW_TIMEOUT_SECONDS)
                 await page.wait_for_timeout(800)
                 await context.storage_state(path=str(_storage_state_path(settings)))
+            except Exception as exc:
+                if _is_closed_browser_error(exc):
+                    await _export_storage_state_after_login_window_closed(playwright, settings, profile_dir)
+                else:
+                    raise
             finally:
-                await context.close()
+                await _close_context_safely(context)
     return "Login completed and exported persistent state."
 
 
@@ -376,14 +385,17 @@ async def _fetch_posts_from_api_url(context, creator_url: str, api_url: str) -> 
 async def _fetch_api_json(context, creator_url: str, api_url: str) -> dict:
     parts = urlsplit(creator_url)
     origin = f"{parts.scheme}://{parts.netloc}"
-    response = await context.request.get(
-        api_url,
-        headers={
-            "Accept": "application/json",
-            "Origin": origin,
-            "Referer": _build_posts_page_url(creator_url, 1),
-        },
-    )
+    try:
+        response = await context.request.get(
+            api_url,
+            headers={
+                "Accept": "application/json",
+                "Origin": origin,
+                "Referer": _build_posts_page_url(creator_url, 1),
+            },
+        )
+    except Exception as exc:
+        raise FanboxAuthError(f"Fanbox API request failed: {_redact_sensitive_request_details(str(exc))}") from exc
     payload = await response.json()
     if response.status >= 400:
         raise FanboxAuthError(f"Fanbox API request failed: {response.status}")
@@ -816,20 +828,35 @@ def _validate_creator_url_for_refresh(creator_url: str) -> None:
         raise FanboxConfigurationError("当前 Fanbox 页面地址格式无效，请重新填写完整的创作者主页链接。")
 
 
-async def _probe_fanbox_login_state(context) -> tuple[bool, str | None]:
+async def _probe_fanbox_login_state(context, page=None) -> tuple[bool, str | None]:
+    probe_page = page
+    close_probe_page = False
     try:
-        response = await context.request.get(
-            AUTH_CHECK_URL,
-            timeout=AUTH_CHECK_TIMEOUT_MS,
-            fail_on_status_code=False,
-        )
-        if _is_login_redirect_url(response.url):
+        if probe_page is None:
+            probe_page = await context.new_page()
+            close_probe_page = True
+            response = await probe_page.goto(
+                AUTH_CHECK_URL,
+                wait_until="domcontentloaded",
+                timeout=AUTH_CHECK_TIMEOUT_MS,
+            )
+            if _is_login_redirect_url(probe_page.url):
+                return False, "Fanbox redirected to the Pixiv login page."
+            if response is not None and response.status >= 400:
+                return False, f"Fanbox auth check returned HTTP {response.status}."
+        elif _is_login_redirect_url(probe_page.url):
             return False, "Fanbox redirected to the Pixiv login page."
-        if response.status >= 400:
-            return False, f"Fanbox auth check returned HTTP {response.status}."
+
+        await _dismiss_age_confirmation(probe_page)
+        await _ensure_authenticated(probe_page)
         return True, None
+    except FanboxAuthError as exc:
+        return False, _redact_sensitive_request_details(str(exc))
     except Exception as exc:
-        return False, f"Unable to verify Fanbox login state: {exc}"
+        return False, f"Unable to verify Fanbox login state: {_redact_sensitive_request_details(str(exc))}"
+    finally:
+        if close_probe_page and probe_page is not None:
+            await _close_page_safely(probe_page)
 
 
 async def _wait_for_login_completion(context, page, timeout_seconds: int) -> None:
@@ -838,7 +865,7 @@ async def _wait_for_login_completion(context, page, timeout_seconds: int) -> Non
 
     while asyncio.get_running_loop().time() < deadline:
         await _dismiss_age_confirmation(page)
-        authenticated, reason = await _probe_fanbox_login_state(context)
+        authenticated, reason = await _probe_fanbox_login_state(context, page)
         if authenticated:
             return
         last_error = reason
@@ -848,6 +875,23 @@ async def _wait_for_login_completion(context, page, timeout_seconds: int) -> Non
     raise FanboxAuthError(f"Login was not completed within {timeout_seconds} seconds.{detail}")
 
 
+async def _export_storage_state_after_login_window_closed(playwright, settings: Settings, profile_dir: Path) -> None:
+    context = await _launch_persistent_context_with_retry(
+        playwright,
+        profile_dir=profile_dir,
+        channel=settings.playwright_channel,
+        headless=True,
+    )
+    try:
+        authenticated, reason = await _probe_fanbox_login_state(context)
+        if not authenticated:
+            detail = f" {reason}" if reason else ""
+            raise FanboxAuthError(f"Unable to verify Fanbox login state after the login window closed.{detail}")
+        await context.storage_state(path=str(_storage_state_path(settings)))
+    finally:
+        await _close_context_safely(context)
+
+
 async def _dismiss_age_confirmation(page) -> None:
     modal = page.locator("div.ConfirmAdultContentModal__ButtonWrapper-sc-10ovg9m-5")
     if await modal.count() == 0:
@@ -855,6 +899,36 @@ async def _dismiss_age_confirmation(page) -> None:
     yes_button = modal.locator("button").last
     if await yes_button.count():
         await yes_button.click(force=True)
+
+
+async def _close_context_safely(context) -> None:
+    try:
+        await context.close()
+    except Exception:
+        return
+
+
+async def _close_page_safely(page) -> None:
+    try:
+        await page.close()
+    except Exception:
+        return
+
+
+def _redact_sensitive_request_details(message: str) -> str:
+    return re.sub(r"(?im)(^\s*-\s*cookie:\s*).*$", r"\1[redacted]", message)
+
+
+def _is_closed_browser_error(exc: Exception) -> bool:
+    message = str(exc).lower()
+    closed_markers = [
+        "target page, context or browser has been closed",
+        "target page has been closed",
+        "context has been closed",
+        "browser has been closed",
+        "target closed",
+    ]
+    return any(marker in message for marker in closed_markers)
 
 
 def _is_windows_desktop() -> bool:
@@ -1018,6 +1092,10 @@ async def _launch_persistent_context_with_retry(
     }
     if profile_dir is not None:
         launch_options["user_data_dir"] = str(profile_dir)
+    if "proxy" not in launch_options:
+        proxy_settings = _resolve_playwright_proxy_settings()
+        if proxy_settings is not None:
+            launch_options["proxy"] = proxy_settings
 
     for attempt, retry_delay in enumerate((0.0, *PERSISTENT_CONTEXT_LAUNCH_RETRY_DELAYS_SECONDS), start=1):
         if retry_delay > 0:
@@ -1027,6 +1105,43 @@ async def _launch_persistent_context_with_retry(
         except Exception as exc:
             if attempt > len(PERSISTENT_CONTEXT_LAUNCH_RETRY_DELAYS_SECONDS) or not _is_retryable_persistent_context_error(exc):
                 raise
+
+
+def _resolve_playwright_proxy_settings() -> dict[str, str] | None:
+    proxy_url = _normalize_proxy_server(getproxies().get("https") or getproxies().get("http"))
+    if proxy_url is None:
+        return None
+    if not _is_proxy_endpoint_available(proxy_url):
+        return None
+    return {
+        "server": proxy_url,
+        "bypass": PLAYWRIGHT_PROXY_BYPASS,
+    }
+
+
+def _normalize_proxy_server(proxy_url: str | None) -> str | None:
+    if not proxy_url:
+        return None
+    candidate = proxy_url.strip()
+    if not candidate:
+        return None
+    if "://" not in candidate:
+        candidate = f"http://{candidate}"
+    parsed = urlsplit(candidate)
+    if not parsed.hostname or parsed.port is None:
+        return None
+    return candidate
+
+
+def _is_proxy_endpoint_available(proxy_url: str) -> bool:
+    parsed = urlsplit(proxy_url)
+    if not parsed.hostname or parsed.port is None:
+        return False
+    try:
+        with socket.create_connection((parsed.hostname, parsed.port), timeout=PROXY_CONNECT_TIMEOUT_SECONDS):
+            return True
+    except OSError:
+        return False
 
 
 def _is_retryable_persistent_context_error(exc: Exception) -> bool:

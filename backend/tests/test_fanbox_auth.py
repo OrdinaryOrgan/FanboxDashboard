@@ -3,11 +3,16 @@ from pathlib import Path
 
 from app.db.models import Settings
 from app.services.fanbox import (
+    AUTH_CHECK_TIMEOUT_MS,
+    AUTH_CHECK_URL,
     LOGIN_PAGE_URL,
     FanboxAuthError,
     _acquire_profile_context_lock,
     _find_new_chromium_window,
     _launch_persistent_context_with_retry,
+    _normalize_proxy_server,
+    _probe_fanbox_login_state,
+    _redact_sensitive_request_details,
     inspect_auth_status,
     logout_fanbox,
     open_login_window,
@@ -34,7 +39,7 @@ def test_wait_for_login_completion_returns_once_page_is_authenticated(monkeypatc
         (True, None),
     ]
 
-    async def fake_probe(_context) -> tuple[bool, str | None]:
+    async def fake_probe(_context, _page) -> tuple[bool, str | None]:
         return responses.pop(0)
 
     monkeypatch.setattr("app.services.fanbox._dismiss_age_confirmation", _noop)
@@ -50,7 +55,7 @@ def test_wait_for_login_completion_raises_after_timeout(monkeypatch) -> None:
     async def _noop(_page) -> None:
         return None
 
-    async def fake_probe(_context) -> tuple[bool, str | None]:
+    async def fake_probe(_context, _page) -> tuple[bool, str | None]:
         return False, "Fanbox redirected to the Pixiv login page."
 
     monkeypatch.setattr("app.services.fanbox._dismiss_age_confirmation", _noop)
@@ -89,14 +94,27 @@ def test_find_new_chromium_window_prefers_matching_title(monkeypatch) -> None:
 
 
 class _FakeOpenLoginPage:
-    def __init__(self) -> None:
-        self.goto_calls: list[tuple[str, str]] = []
+    def __init__(
+        self,
+        initial_url: str = "about:blank",
+        body_text: str = "Notifications",
+        goto_result_url: str | None = None,
+        goto_status: int = 200,
+    ) -> None:
+        self.url = initial_url
+        self.body_text = body_text
+        self.goto_result_url = goto_result_url
+        self.goto_status = goto_status
+        self.goto_calls: list[tuple[str, str, int | None]] = []
         self.call_order: list[str] = []
         self.bring_to_front_calls = 0
+        self.closed = False
 
-    async def goto(self, url: str, wait_until: str) -> None:
+    async def goto(self, url: str, wait_until: str, timeout: int | None = None):
         self.call_order.append("goto")
-        self.goto_calls.append((url, wait_until))
+        self.goto_calls.append((url, wait_until, timeout))
+        self.url = self.goto_result_url or url
+        return _FakePageResponse(self.goto_status)
 
     async def bring_to_front(self) -> None:
         self.call_order.append("bring_to_front")
@@ -106,6 +124,39 @@ class _FakeOpenLoginPage:
         return "PIXIV Login"
 
     async def wait_for_timeout(self, _: int) -> None:
+        return None
+
+    def locator(self, selector: str):
+        if selector == "body":
+            return _FakeBodyLocator(self)
+        return _FakeEmptyLocator()
+
+    async def close(self) -> None:
+        self.closed = True
+
+
+class _FakePageResponse:
+    def __init__(self, status: int) -> None:
+        self.status = status
+
+
+class _FakeBodyLocator:
+    def __init__(self, page: _FakeOpenLoginPage) -> None:
+        self.page = page
+
+    async def inner_text(self) -> str:
+        return self.page.body_text
+
+
+class _FakeEmptyLocator:
+    @property
+    def last(self):
+        return self
+
+    async def count(self) -> int:
+        return 0
+
+    async def click(self, force: bool = False) -> None:
         return None
 
 
@@ -212,15 +263,48 @@ def test_open_login_window_uses_windows_maximize_and_focus(monkeypatch, tmp_path
     assert playwright.launch_kwargs["no_viewport"] is True
     assert playwright.launch_kwargs["args"] == ["--start-maximized"]
     assert page.call_order[:3] == ["focus_helper", "goto", "wait_for_login_completion"]
-    assert page.goto_calls == [(LOGIN_PAGE_URL, "domcontentloaded")]
+    assert page.goto_calls == [(LOGIN_PAGE_URL, "domcontentloaded", None)]
     assert focus_calls == [(page, {11, 22})]
     assert wait_calls == [(context, page, 180)]
     assert context.storage_state_paths == [str(storage_state_path)]
     assert context.closed is True
 
 
-def test_inspect_auth_status_verifies_fanbox_session(monkeypatch, tmp_path: Path) -> None:
+def test_open_login_window_recovers_storage_state_after_closed_window(monkeypatch, tmp_path: Path) -> None:
     page = _FakeOpenLoginPage()
+    context = _FakeOpenLoginContext(page)
+    playwright = _FakeOpenLoginPlaywright(context)
+    recover_calls: list[tuple[object, str]] = []
+
+    async def fake_get_async_playwright():
+        return _FakeAsyncPlaywrightFactory(playwright)
+
+    async def fake_wait_for_login_completion(_context_obj, _page_obj, timeout_seconds: int) -> None:
+        raise RuntimeError("Target page, context or browser has been closed")
+
+    async def fake_recover(playwright_obj, _settings, profile_dir: Path) -> None:
+        recover_calls.append((playwright_obj, str(profile_dir)))
+
+    monkeypatch.setattr("app.services.fanbox._get_async_playwright", fake_get_async_playwright)
+    monkeypatch.setattr("app.services.fanbox._is_windows_desktop", lambda: False)
+    monkeypatch.setattr("app.services.fanbox._wait_for_login_completion", fake_wait_for_login_completion)
+    monkeypatch.setattr("app.services.fanbox._export_storage_state_after_login_window_closed", fake_recover)
+
+    settings = Settings(
+        creator_url="https://www.fanbox.cc/",
+        profile_dir=str(tmp_path / "profile"),
+        playwright_channel="msedge",
+    )
+
+    message = asyncio.run(open_login_window(settings))
+
+    assert message == "Login completed and exported persistent state."
+    assert recover_calls == [(playwright, str(tmp_path / "profile"))]
+    assert context.closed is True
+
+
+def test_inspect_auth_status_verifies_fanbox_session(monkeypatch, tmp_path: Path) -> None:
+    page = _FakeOpenLoginPage(goto_result_url=AUTH_CHECK_URL, body_text="Notifications")
     context = _FakeOpenLoginContext(page)
     playwright = _FakeOpenLoginPlaywright(context)
     storage_state_path = tmp_path / "profile" / "storage_state.json"
@@ -231,11 +315,7 @@ def test_inspect_auth_status_verifies_fanbox_session(monkeypatch, tmp_path: Path
     async def fake_get_async_playwright():
         return _FakeAsyncPlaywrightFactory(playwright)
 
-    async def fake_probe(_context) -> tuple[bool, str | None]:
-        return False, "Fanbox redirected to the Pixiv login page."
-
     monkeypatch.setattr("app.services.fanbox._get_async_playwright", fake_get_async_playwright)
-    monkeypatch.setattr("app.services.fanbox._probe_fanbox_login_state", fake_probe)
 
     settings = Settings(
         creator_url="https://www.fanbox.cc/",
@@ -245,37 +325,45 @@ def test_inspect_auth_status_verifies_fanbox_session(monkeypatch, tmp_path: Path
 
     authenticated, reason = asyncio.run(inspect_auth_status(settings))
 
-    assert authenticated is False
-    assert reason == "Fanbox redirected to the Pixiv login page."
+    assert authenticated is True
+    assert reason == "Persistent profile, exported state, and Fanbox login are valid."
     assert playwright.launch_kwargs is not None
     assert playwright.launch_kwargs["headless"] is True
+    assert page.goto_calls == [(AUTH_CHECK_URL, "domcontentloaded", AUTH_CHECK_TIMEOUT_MS)]
+    assert page.closed is True
     assert context.closed is True
 
 
-def test_probe_fanbox_login_state_uses_background_request(monkeypatch) -> None:
-    from app.services.fanbox import AUTH_CHECK_TIMEOUT_MS, AUTH_CHECK_URL, _probe_fanbox_login_state
-
-    page = _FakeOpenLoginPage()
+def test_probe_fanbox_login_state_uses_page_navigation() -> None:
+    page = _FakeOpenLoginPage(goto_result_url=AUTH_CHECK_URL, body_text="Notifications")
     context = _FakeOpenLoginContext(page)
-    request = _FakeRequestContext([
-        _FakeRequestResponse("https://accounts.pixiv.net/login?prompt=select_account", 200),
-        _FakeRequestResponse(AUTH_CHECK_URL, 200),
-    ])
-    context.request = request
-
-    authenticated, reason = asyncio.run(_probe_fanbox_login_state(context))
-    assert authenticated is False
-    assert reason == "Fanbox redirected to the Pixiv login page."
-    assert context.pages == []
 
     authenticated, reason = asyncio.run(_probe_fanbox_login_state(context))
     assert authenticated is True
     assert reason is None
-    assert context.pages == []
-    assert request.calls == [
-        (AUTH_CHECK_URL, AUTH_CHECK_TIMEOUT_MS, False),
-        (AUTH_CHECK_URL, AUTH_CHECK_TIMEOUT_MS, False),
-    ]
+    assert page.goto_calls == [(AUTH_CHECK_URL, "domcontentloaded", AUTH_CHECK_TIMEOUT_MS)]
+    assert page.closed is True
+
+
+def test_probe_fanbox_login_state_reports_redirected_login_page() -> None:
+    page = _FakeOpenLoginPage(goto_result_url="https://accounts.pixiv.net/login?prompt=select_account")
+    context = _FakeOpenLoginContext(page)
+
+    authenticated, reason = asyncio.run(_probe_fanbox_login_state(context))
+
+    assert authenticated is False
+    assert reason == "Fanbox redirected to the Pixiv login page."
+    assert page.closed is True
+
+
+def test_redact_sensitive_request_details_removes_cookie_header() -> None:
+    message = "Call log:\n  - cookie: FANBOXSESSID=secret; cf_clearance=secret\n  - accept: */*"
+
+    redacted = _redact_sensitive_request_details(message)
+
+    assert "FANBOXSESSID" not in redacted
+    assert "cf_clearance" not in redacted
+    assert "  - cookie: [redacted]" in redacted
 
 
 class _RetryableLaunchError(RuntimeError):
@@ -327,6 +415,51 @@ def test_launch_persistent_context_with_retry_retries_closed_browser(monkeypatch
     assert context is not None
     assert len(chromium.calls) == 2
     assert sleep_calls == [0.35]
+
+
+def test_launch_persistent_context_with_retry_uses_detected_proxy(monkeypatch, tmp_path: Path) -> None:
+    chromium = _FakeRetryChromium([object()])
+    playwright = _FakeRetryPlaywright(chromium)
+    proxy = {"server": "http://127.0.0.1:7890", "bypass": "127.0.0.1,localhost,::1"}
+
+    monkeypatch.setattr("app.services.fanbox._resolve_playwright_proxy_settings", lambda: proxy)
+
+    context = asyncio.run(
+        _launch_persistent_context_with_retry(
+            playwright,
+            profile_dir=tmp_path / "profile",
+            channel="msedge",
+            headless=True,
+        )
+    )
+
+    assert context is not None
+    assert chromium.calls[0]["proxy"] == proxy
+
+
+def test_launch_persistent_context_with_retry_skips_proxy_when_unavailable(monkeypatch, tmp_path: Path) -> None:
+    chromium = _FakeRetryChromium([object()])
+    playwright = _FakeRetryPlaywright(chromium)
+
+    monkeypatch.setattr("app.services.fanbox._resolve_playwright_proxy_settings", lambda: None)
+
+    context = asyncio.run(
+        _launch_persistent_context_with_retry(
+            playwright,
+            profile_dir=tmp_path / "profile",
+            channel="msedge",
+            headless=True,
+        )
+    )
+
+    assert context is not None
+    assert "proxy" not in chromium.calls[0]
+
+
+def test_normalize_proxy_server_accepts_host_port() -> None:
+    assert _normalize_proxy_server("127.0.0.1:7890") == "http://127.0.0.1:7890"
+    assert _normalize_proxy_server("http://127.0.0.1:7890") == "http://127.0.0.1:7890"
+    assert _normalize_proxy_server("") is None
 
 
 def test_profile_context_lock_serializes_same_profile(tmp_path: Path) -> None:
